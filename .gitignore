@@ -1,0 +1,10 @@
+/projects
+/.idea
+__pycache__/
+*.pyc
+/.venv
+/.env
+/ast-analyzer/target/
+/analysis/
+/notebooks/
+/data/*.csv
