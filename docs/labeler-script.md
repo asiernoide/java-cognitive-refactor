@@ -4,7 +4,15 @@
 
 `metrics_classifier.py` es un clasificador determinista que asigna etiquetas de refactorización a métodos Java basándose **exclusivamente en las métricas estructurales del CSV**, sin leer el código fuente.
 
-Las métricas son generadas por el pipeline `main.py` → `ast-analyzer.jar`, que extrae 16 métricas del AST de cada método detectado por SonarQube (regla `java:S3776`, `cognitive_complexity > 15`).
+### Evolución del enfoque de etiquetado
+
+El proyecto pasó por tres fases en su estrategia de clasificación:
+
+1. **Script basado en código fuente** — Inicialmente se desarrolló un etiquetador que analizaba directamente el cuerpo de cada método Java, imitando el criterio de un revisor humano. El objetivo era generar etiquetas automáticas para luego validar manualmente un porcentaje, agilizando la anotación del dataset.
+
+2. **Experimento con Machine Learning** — Se entrenó un Random Forest sobre las etiquetas del script. El modelo funcionó aceptablemente para `extract_method` (F1=0.87) y `collapse_ifs` (F1=0.63), pero fracasó en los labels de streams/lambdas debido a la fuerte disparidad entre clases (solo 8 métodos de 989 tenían `filter_map`). La conclusión fue que las etiquetas del script basado en código fuente eran intrínsecamente mejores que cualquier etiqueta que un ML pudiera producir entrenándose sobre métricas agregadas.
+
+3. **Clasificador por reglas sobre métricas** — Se descartó el ML y se refinó el etiquetado para operar exclusivamente sobre las 16 métricas del CSV, incluyendo 5 métricas nuevas (`return_count`, `try_catch_count`, `switch_case_count`, `loop_body_max_statements`, `parameter_count`) añadidas al analizador AST porque el script original ya las utilizaba implícitamente en sus decisiones. El resultado es `metrics_classifier.py`: reglas deterministas, transparentes y sin dependencia de los archivos fuente.
 
 ## Objetivo
 
@@ -96,14 +104,14 @@ Esto significa que si un método tiene simultáneamente `collapse_ifs` y `lambda
 
 El CSV de salida contiene todas las columnas originales más 5 columnas nuevas con el sufijo `_metrics` (ej: `refactor_extract_method_metrics`), con valor `1` o `0`.
 
-Además, si el CSV de entrada ya contiene columnas de refactorización (del script original basado en código fuente), el script imprime una comparativa: porcentaje de acierto y recall por label.
+Además, si el CSV de entrada ya contiene columnas de refactorización (por ejemplo, del etiquetador original basado en código fuente de la Fase 1), el script imprime una comparativa: porcentaje de acierto y recall por label.
 
 ---
 
 ## Uso
 
 ```bash
-cd Scripts/
+cd java-cognitive-refactor/
 python metrics_classifier.py
 ```
 

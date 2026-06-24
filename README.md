@@ -8,7 +8,7 @@ Sistema de detección, clasificación y refactorización automática de métodos
 
 El proyecto se divide en dos fases:
 
-1. **Detección y clasificación** *(implementada)*: SonarQube detecta métodos con `cognitive_complexity > 15` (regla `java:S3776`). Un analizador AST extrae 16 métricas estructurales de cada método. Un clasificador determinista (`metrics_classifier.py`) aplica reglas sobre esas métricas para determinar qué técnica de refactorización corresponde.
+1. **Detección y clasificación** *(implementada)*: SonarQube detecta métodos con `cognitive_complexity > 15` (regla `java:S3776`). Un analizador AST extrae 16 métricas estructurales de cada método. Un clasificador determinista (`metrics_classifier.py`) aplica reglas sobre esas métricas para determinar qué técnica de refactorización corresponde. [Más sobre la evolución del enfoque de etiquetado →](docs/labeler-script.md#evolución-del-enfoque-de-etiquetado)
 2. **Refactorización automática** *(pendiente)*: un LLM aplicará la técnica recomendada generando el código refactorizado.
 
 ```
