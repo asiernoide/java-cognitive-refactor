@@ -23,7 +23,7 @@ SonarQube (Docker)          AST Analyzer (JavaParser)        metrics_classifier.
 ## Estructura del proyecto
 
 ```
-Scripts/
+java-cognitive-refactor/
 ├── main.py                       # Pipeline principal
 ├── metrics_classifier.py         # Clasificador basado en reglas sobre métricas
 │
@@ -65,7 +65,6 @@ Scripts/
   ```
 - **Java 17+** para ejecutar `ast-analyzer.jar`.
 - **SonarQube** ejecutándose en Docker en `http://localhost:9000` con los proyectos a analizar ya indexados. Cada proyecto debe estar registrado en SonarQube con un **Project Key** que coincida exactamente (1:1) con el nombre de su carpeta dentro de `projects/`. Ejemplo: si la carpeta es `projects/mi-proyecto`, el Project Key en SonarQube debe ser `mi-proyecto`.
-- **Maven** para reconstruir el analizador AST (solo si se modifica el código Java).
 
 ---
 
@@ -87,7 +86,7 @@ DATA_DIR=data
 ### 1. Pipeline completo (SonarQube → AST → CSV)
 
 ```bash
-cd Scripts/
+cd java-cognitive-refactor/
 python main.py
 ```
 
@@ -109,14 +108,6 @@ python metrics_classifier.py
 
 Aplica reglas deterministas sobre las métricas del CSV para predecir refactorizaciones. El CSV de salida se guarda en `analysis/output/`.
 
-### 4. Reconstruir el analizador AST
-
-```bash
-cd ast-analyzer/
-mvn package
-copy target\ast-analyzer.jar ast-analyzer.jar
-```
-
 ---
 
 ## Técnicas de refactorización evaluadas
@@ -134,6 +125,27 @@ El proyecto etiqueta cada método con hasta 2 de las siguientes 5 técnicas:
 Cada columna contiene `1` si la técnica es aplicable o `0` si no lo es.
 
 La documentación detallada de las reglas de clasificación y el funcionamiento de `metrics_classifier.py` está en [docs/labeler-script.md](docs/labeler-script.md).
+
+---
+
+## Anexo: Añadir nuevas métricas al analizador AST
+
+Si necesitas modificar el analizador AST (por ejemplo, para añadir nuevas métricas):
+
+```bash
+cd ast-analyzer/
+# Edita ASTAnalyzer.java y MethodMetrics.java
+mvn package
+copy target\ast-analyzer.jar ast-analyzer.jar
+```
+
+Después de reconstruir el JAR, **debes volver a ejecutar `main.py`** para regenerar los CSVs con las nuevas métricas:
+
+```bash
+cd ..
+python main.py
+python data/aggregate_method_data.py
+```
 
 ---
 
