@@ -10,6 +10,13 @@ public class MethodMetrics {
     public String method_name;
     public int method_start_line;
     public int method_end_line;
+    public String method_signature;   // nombre(tipos de parámetros) — único dentro de una clase
+    public String enclosing_class;    // clase(s) contenedora(s) separadas por '.' (p.ej. "Outer.Inner")
+
+    // --- Complejidad cognitiva (SonarSource / S3776) ---
+    // Replica local del algoritmo de Cognitive Complexity de SonarQube,
+    // calculada sobre el AST con JavaParser (sin necesidad de SonarQube).
+    public int cognitive_complexity;
 
     // --- Tamaño ---
     public int loc;               // Líneas de código (end - start + 1)

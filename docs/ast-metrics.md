@@ -1,6 +1,8 @@
 # AST Analyzer — Métricas extraídas
 
-Métricas estructurales calculadas por `ast-analyzer.jar` para cada método Java analizado. El analizador recibe la ruta del archivo y el número de línea donde SonarQube detectó el issue, localiza el método correspondiente en el AST y devuelve el siguiente conjunto de métricas en formato JSON.
+Métricas estructurales calculadas por `ast-analyzer.jar` para cada método Java analizado. El analizador localiza el método en el AST —por línea, por signatura o mediante el modo `scan` de un proyecto— y devuelve el siguiente conjunto de métricas en formato JSON.
+
+Además, calcula la `cognitive_complexity` replicando el algoritmo de Cognitive Complexity de SonarSource (ver [README — Complejidad cognitiva local](../README.md#complejidad-cognitiva-local)).
 
 ---
 
@@ -11,6 +13,8 @@ Métricas estructurales calculadas por `ast-analyzer.jar` para cada método Java
 | `method_name` | string | Nombre del método analizado. |
 | `method_start_line` | int | Línea de inicio del método en el archivo fuente. |
 | `method_end_line` | int | Línea de fin del método en el archivo fuente. |
+| `method_signature` | string | Signatura `nombre(tipo1,tipo2)`, única dentro de una clase. Sirve para localizar el método por signatura (`java -jar ast-analyzer.jar <archivo> "nombre(tipos)"`), necesaria tras un refactor porque las líneas cambian. |
+| `enclosing_class` | string | Clase(s) contenedora(s) separadas por `.` (p.ej. `Outer.Inner`). Permite desambiguar firmas repetidas en distintas clases del mismo archivo (`java -jar ast-analyzer.jar <archivo> "Clase.nombre(tipos)"`). |
 
 ---
 
@@ -18,7 +22,7 @@ Métricas estructurales calculadas por `ast-analyzer.jar` para cada método Java
 
 | Métrica | Tipo | Descripción |
 |---|---|---|
-| `loc` | int | Líneas de código del método (`end_line - start_line + 1`). Más fiable que el LOC de SonarQube porque se calcula sobre el rango exacto del método según el AST. |
+| `loc` | int | Líneas de código del método (`end_line - start_line + 1`), calculadas sobre el rango exacto del método según el AST. |
 | `statement_count` | int | Número de statements con valor semántico real (asignaciones, llamadas, returns, bucles, condicionales). Se excluyen bloques vacíos y puntos y coma sueltos. Señal principal para detectar candidatos a **Extract Method**. |
 | `parameter_count` | int | Número de parámetros del método. Métodos con 5+ parámetros suelen indicar sobrecarga de responsabilidades y son candidatos a **Extract Method** o a encapsular parámetros en un objeto. |
 | `return_count` | int | Número de sentencias `return` en el método. Múltiples puntos de salida temprana indican validaciones o ramas independientes extraíbles a métodos separados (**Extract Method**). |

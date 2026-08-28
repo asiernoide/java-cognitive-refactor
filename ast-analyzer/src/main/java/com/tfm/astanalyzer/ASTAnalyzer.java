@@ -2,9 +2,11 @@ package com.tfm.astanalyzer;
 
 import com.github.javaparser.StaticJavaParser;
 import com.github.javaparser.ast.CompilationUnit;
+import com.github.javaparser.ast.Node;
 import com.github.javaparser.ast.body.CallableDeclaration;
 import com.github.javaparser.ast.body.ConstructorDeclaration;
 import com.github.javaparser.ast.body.MethodDeclaration;
+import com.github.javaparser.ast.body.TypeDeclaration;
 import com.github.javaparser.ast.stmt.*;
 import com.github.javaparser.ast.expr.LambdaExpr;
 import com.github.javaparser.ast.stmt.ReturnStmt;
@@ -17,94 +19,84 @@ import com.github.javaparser.ast.stmt.DoStmt;
 import com.github.javaparser.ast.body.Parameter;
 import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
+import com.google.gson.JsonObject;
 
 import java.io.FileInputStream;
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Optional;
+import java.util.Set;
+import java.util.stream.Stream;
 
 /**
  * Analizador de AST para métodos Java.
  *
  * Uso:
- *   java -jar ast-analyzer.jar <ruta_archivo.java> <numero_linea>
+ *   java -jar ast-analyzer.jar <archivo.java> <numero_linea>
+ *   java -jar ast-analyzer.jar <archivo.java> <firma>
+ *   java -jar ast-analyzer.jar scan <raiz_proyecto> [umbral]
+ *
+ * Donde:
+ *   - <numero_linea> es un entero: se analiza el método que contiene esa línea.
+ *   - <firma> es "nombreMetodo(tipo1,tipo2)" (único dentro de una clase), con
+ *     prefijo de clase opcional "Clase.nombreMetodo(tipo1)". Sirve para localizar
+ *     métodos tras un refactor, cuando las líneas ya no son válidas.
+ *   - "scan <raiz_proyecto> [umbral]" recorre el proyecto (los archivos .java)
+ *     y devuelve un JSON array con todos los métodos cuya cognitive_complexity
+ *     supera el umbral (por defecto 15). Es la DETECCIÓN local de métodos
+ *     complejos, sin necesidad de SonarQube.
  *
  * Salida (stdout):
- *   JSON con métricas estructurales del método que contiene la línea indicada.
+ *   JSON con métricas estructurales del método encontrado (modos 1 y 2) o
+ *   JSON array de métodos complejos (modo scan).
  */
 public class ASTAnalyzer {
 
     public static void main(String[] args) {
+        // Modo escaneo de proyecto: detección local de métodos complejos.
+        if (args.length >= 2 && args[0].equals("scan")) {
+            int threshold = 15;
+            if (args.length >= 3) {
+                try {
+                    threshold = Integer.parseInt(args[2]);
+                } catch (NumberFormatException e) {
+                    System.err.println("Error: el umbral debe ser un número entero.");
+                    System.exit(1);
+                    return;
+                }
+            }
+            scanProject(args[1], threshold);
+            return;
+        }
+
         if (args.length < 2) {
-            System.err.println("Uso: java -jar ast-analyzer.jar <archivo.java> <linea>");
+            System.err.println("Uso:");
+            System.err.println("  java -jar ast-analyzer.jar <archivo.java> <linea|firma>");
+            System.err.println("  java -jar ast-analyzer.jar scan <raiz_proyecto> [umbral]");
             System.exit(1);
         }
 
         String filePath = args[0];
-        int targetLine;
-
-        try {
-            targetLine = Integer.parseInt(args[1]);
-        } catch (NumberFormatException e) {
-            System.err.println("Error: la línea debe ser un número entero.");
-            System.exit(1);
-            return;
-        }
+        String anchor = args[1];
 
         try {
             CompilationUnit cu = StaticJavaParser.parse(new FileInputStream(filePath));
 
-            // Reunir métodos y constructores en una lista común.
-            // JavaParser los representa con nodos distintos (MethodDeclaration y
-            // ConstructorDeclaration), pero ambos implementan CallableDeclaration,
-            // que proporciona nombre, cuerpo y rango de forma uniforme.
-            List<CallableDeclaration<?>> allCallables = new ArrayList<>();
-            allCallables.addAll(cu.findAll(MethodDeclaration.class));
-            allCallables.addAll(cu.findAll(ConstructorDeclaration.class));
+            Optional<CallableDeclaration<?>> method = isInteger(anchor)
+                    ? findByLine(cu, Integer.parseInt(anchor))
+                    : findBySignature(cu, anchor);
 
-            List<CallableDeclaration<?>> withRange = allCallables.stream()
-                    .filter(m -> m.getRange().isPresent())
-                    .toList();
-
-            // Fase 1: búsqueda exacta — la línea cae dentro del rango del callable.
-            // Si hay callables anidados (clases internas), quedarse con el más pequeño.
-            Optional<CallableDeclaration<?>> found = withRange.stream()
-                    .filter(m -> {
-                        int begin = m.getRange().get().begin.line;
-                        int end   = m.getRange().get().end.line;
-                        return targetLine >= begin && targetLine <= end;
-                    })
-                    .min((a, b) -> {
-                        int sizeA = a.getRange().get().end.line - a.getRange().get().begin.line;
-                        int sizeB = b.getRange().get().end.line - b.getRange().get().begin.line;
-                        return Integer.compare(sizeA, sizeB);
-                    });
-
-            // Fase 2: búsqueda por proximidad — SonarQube a veces reporta la línea
-            // de la firma de un callable multilínea, que puede quedar fuera del rango
-            // exacto. Se busca el callable cuyo inicio sea el más cercano dentro de
-            // un margen de 5 líneas.
-            if (found.isEmpty()) {
-                found = withRange.stream()
-                        .filter(m -> {
-                            int begin = m.getRange().get().begin.line;
-                            return begin > targetLine - 5 && begin <= targetLine + 1;
-                        })
-                        .min((a, b) -> {
-                            int distA = Math.abs(a.getRange().get().begin.line - targetLine);
-                            int distB = Math.abs(b.getRange().get().begin.line - targetLine);
-                            return Integer.compare(distA, distB);
-                        });
-            }
-
-            if (found.isEmpty()) {
-                System.err.println("No se encontró ningún método en la línea " + targetLine);
+            if (method.isEmpty()) {
+                System.err.println("No se encontró ningún método para: " + anchor);
                 System.exit(2);
                 return;
             }
 
-            CallableDeclaration<?> method = found.get();
-            MethodMetrics metrics = analyzeMethod(method);
+            MethodMetrics metrics = analyzeMethod(method.get());
 
             Gson gson = new GsonBuilder().setPrettyPrinting().create();
             System.out.println(gson.toJson(metrics));
@@ -113,6 +105,325 @@ public class ASTAnalyzer {
             System.err.println("Error al parsear el archivo: " + e.getMessage());
             System.exit(3);
         }
+    }
+
+    // -------------------------------------------------------------------------
+    // ESCANEO DE PROYECTO (DETECCIÓN LOCAL DE MÉTODOS COMPLEJOS)
+    // -------------------------------------------------------------------------
+
+    /**
+     * Recorre un proyecto, analiza todos sus métodos y devuelve (por stdout) un
+     * JSON array con los que superan el umbral de complejidad cognitiva.
+     * Reemplaza la detección que antes hacía SonarQube (regla S3776).
+     *
+     * Las raíces de fuentes se detectan automáticamente por módulo (ver
+     * detectSourceRoots): cubre proyectos de un solo módulo, multi-módulo
+     * (Maven/Gradle) y layouts Ant (src directa).
+     */
+    private static void scanProject(String projectRoot, int threshold) {
+        Path root = Path.of(projectRoot);
+        if (!Files.isDirectory(root)) {
+            System.err.println("Error: no es un directorio: " + projectRoot);
+            System.exit(1);
+            return;
+        }
+
+        Gson gson = new Gson();
+        List<JsonObject> results = new ArrayList<>();
+        Set<Path> files = new LinkedHashSet<>();
+
+        for (Path sourceRoot : detectSourceRoots(root)) {
+            if (!Files.isDirectory(sourceRoot)) continue;
+            try (Stream<Path> paths = Files.walk(sourceRoot)) {
+                paths.filter(Files::isRegularFile)
+                        .filter(p -> p.toString().endsWith(".java"))
+                        .forEach(files::add);
+            } catch (IOException e) {
+                System.err.println("[WARN] Error al recorrer " + sourceRoot + ": " + e.getMessage());
+            }
+        }
+
+        for (Path file : files) {
+            scanFile(root, file, threshold, gson, results);
+        }
+
+        System.out.println(gson.toJson(results));
+    }
+
+    /**
+     * Detecta las raíces de fuentes de un proyecto:
+     *   - Cada directorio con descriptor de build (pom.xml, build.gradle,
+     *     settings.gradle, build.xml) es un módulo.
+     *   - Si el módulo tiene src/main/java → raíz de fuentes.
+     *   - Si no, y src/ contiene código Java directamente (layout Ant, p.ej. moea) → src/.
+     *   - Se excluyen los tests (src/test/java): el dataset original de SonarQube
+     *     no incluía rutas de test, y el TFM se centra en código de producción.
+     * Devuelve rutas absolutas normalizadas, sin duplicados.
+     */
+    private static List<Path> detectSourceRoots(Path projectRoot) {
+        List<Path> moduleRoots = new ArrayList<>();
+        moduleRoots.add(projectRoot);
+        try (Stream<Path> paths = Files.walk(projectRoot)) {
+            paths.filter(Files::isDirectory)
+                    .filter(p -> !p.equals(projectRoot))
+                    .filter(p -> !isBuildOrVcsPath(projectRoot, p))
+                    .filter(ASTAnalyzer::hasBuildDescriptor)
+                    .forEach(moduleRoots::add);
+        } catch (IOException e) {
+            System.err.println("[WARN] No se pudieron localizar los módulos: " + e.getMessage());
+        }
+
+        Set<Path> sourceRoots = new LinkedHashSet<>();
+        for (Path m : moduleRoots) {
+            Path mainJava = m.resolve("src/main/java");
+            if (Files.isDirectory(mainJava)) {
+                sourceRoots.add(mainJava.normalize());
+            } else {
+                Path src = m.resolve("src");
+                if (Files.isDirectory(src) && containsJavaFile(src)) {
+                    sourceRoots.add(src.normalize());
+                }
+            }
+        }
+        return new ArrayList<>(sourceRoots);
+    }
+
+    private static boolean hasBuildDescriptor(Path dir) {
+        return Files.exists(dir.resolve("pom.xml"))
+                || Files.exists(dir.resolve("build.gradle"))
+                || Files.exists(dir.resolve("build.gradle.kts"))
+                || Files.exists(dir.resolve("settings.gradle"))
+                || Files.exists(dir.resolve("settings.gradle.kts"))
+                || Files.exists(dir.resolve("build.xml"));
+    }
+
+    private static boolean containsJavaFile(Path dir) {
+        try (Stream<Path> paths = Files.walk(dir)) {
+            return paths.anyMatch(p -> Files.isRegularFile(p) && p.toString().endsWith(".java"));
+        } catch (IOException e) {
+            return false;
+        }
+    }
+
+    private static void scanFile(Path root, Path file, int threshold, Gson gson, List<JsonObject> results) {
+        try {
+            CompilationUnit cu = StaticJavaParser.parse(file.toFile());
+            for (CallableDeclaration<?> c : collectCallables(cu)) {
+                if (getBody(c).isEmpty()) continue;
+                MethodMetrics m = analyzeMethod(c);
+                if (m.cognitive_complexity > threshold) {
+                    JsonObject obj = new JsonObject();
+                    obj.addProperty("file", root.relativize(file).toString().replace('\\', '/'));
+                    JsonObject metricsObj = (JsonObject) gson.toJsonTree(m);
+                    for (var entry : metricsObj.entrySet()) {
+                        obj.add(entry.getKey(), entry.getValue());
+                    }
+                    results.add(obj);
+                }
+            }
+        } catch (Exception e) {
+            System.err.println("[WARN] No se pudo analizar " + file + ": " + e.getMessage());
+        }
+    }
+
+    /** Excluye directorios de build y control de versiones (target, .git, ...). */
+    private static boolean isBuildOrVcsPath(Path root, Path file) {
+        Path rel = root.relativize(file);
+        for (Path part : rel) {
+            String name = part.toString();
+            if (name.equals(".git") || name.equals(".idea") || name.equals("target")
+                    || name.equals("build") || name.equals("bin") || name.equals("dist")
+                    || name.equals("out") || name.equals("node_modules")) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static boolean isInteger(String s) {
+        if (s == null || s.isEmpty()) return false;
+        for (int i = 0; i < s.length(); i++) {
+            if (!Character.isDigit(s.charAt(i))) return false;
+        }
+        return true;
+    }
+
+    // -------------------------------------------------------------------------
+    // LOCALIZACIÓN DEL MÉTODO
+    // -------------------------------------------------------------------------
+
+    /** Reúne métodos y constructores en una lista común (interfaz CallableDeclaration). */
+    private static List<CallableDeclaration<?>> collectCallables(CompilationUnit cu) {
+        List<CallableDeclaration<?>> all = new ArrayList<>();
+        all.addAll(cu.findAll(MethodDeclaration.class));
+        all.addAll(cu.findAll(ConstructorDeclaration.class));
+        return all;
+    }
+
+    /**
+     * Localiza el método que contiene la línea indicada.
+     * Fase 1: búsqueda exacta (si hay callables anidados, el más pequeño).
+     * Fase 2: por proximidad — SonarQube a veces reporta la línea de la firma de un
+     * callable multilínea que queda fuera del rango exacto.
+     */
+    private static Optional<CallableDeclaration<?>> findByLine(CompilationUnit cu, int targetLine) {
+        List<CallableDeclaration<?>> withRange = collectCallables(cu).stream()
+                .filter(m -> m.getRange().isPresent())
+                .toList();
+
+        Optional<CallableDeclaration<?>> found = withRange.stream()
+                .filter(m -> {
+                    int begin = m.getRange().get().begin.line;
+                    int end   = m.getRange().get().end.line;
+                    return targetLine >= begin && targetLine <= end;
+                })
+                .min((a, b) -> {
+                    int sizeA = a.getRange().get().end.line - a.getRange().get().begin.line;
+                    int sizeB = b.getRange().get().end.line - b.getRange().get().begin.line;
+                    return Integer.compare(sizeA, sizeB);
+                });
+
+        if (found.isEmpty()) {
+            found = withRange.stream()
+                    .filter(m -> {
+                        int begin = m.getRange().get().begin.line;
+                        return begin > targetLine - 5 && begin <= targetLine + 1;
+                    })
+                    .min((a, b) -> {
+                        int distA = Math.abs(a.getRange().get().begin.line - targetLine);
+                        int distB = Math.abs(b.getRange().get().begin.line - targetLine);
+                        return Integer.compare(distA, distB);
+                    });
+        }
+        return found;
+    }
+
+    /**
+     * Localiza un método por signatura "nombre(tipos)" o "Clase.nombre(tipos)".
+     * El nombre + los tipos de parámetros son únicos dentro de una clase (Java no
+     * permite dos métodos con el mismo nombre y tipos de parámetros en la misma
+     * clase), por lo que la firma es estable ante refactorizaciones que cambian
+     * las líneas.
+     */
+    private static Optional<CallableDeclaration<?>> findBySignature(CompilationUnit cu, String signatureArg) {
+        ParsedSignature parsed = parseSignature(signatureArg);
+        List<CallableDeclaration<?>> matches = new ArrayList<>();
+
+        for (CallableDeclaration<?> c : collectCallables(cu)) {
+            if (!c.getNameAsString().equals(parsed.methodName)) continue;
+            if (!paramsMatch(c, parsed)) continue;
+            if (parsed.className != null && !enclosingClassPath(c).endsWith(parsed.className)) continue;
+            if (getBody(c).isEmpty()) continue; // solo métodos con cuerpo
+            matches.add(c);
+        }
+
+        if (matches.size() == 1) {
+            return Optional.of(matches.get(0));
+        }
+        if (matches.size() > 1) {
+            System.err.println("Ambiguo: la firma coincide con varios métodos:");
+            for (CallableDeclaration<?> m : matches) {
+                int line = m.getRange().map(r -> r.begin.line).orElse(-1);
+                System.err.println("  " + enclosingClassPath(m) + "." + signature(m) + " @ línea " + line);
+            }
+            return Optional.empty();
+        }
+        return Optional.empty();
+    }
+
+    /** Signatura "nombre(tipo1,tipo2)" de un callable (sin espacios). */
+    private static String signature(CallableDeclaration<?> m) {
+        StringBuilder sb = new StringBuilder(m.getNameAsString());
+        sb.append('(');
+        boolean first = true;
+        for (Parameter p : m.getParameters()) {
+            if (!first) sb.append(',');
+            sb.append(p.getType().asString());
+            first = false;
+        }
+        sb.append(')');
+        return sb.toString();
+    }
+
+    /** Ruta de la(s) clase(s) contenedora(s), p.ej. "Outer.Inner". */
+    private static String enclosingClassPath(CallableDeclaration<?> m) {
+        List<String> names = new ArrayList<>();
+        Optional<Node> parent = m.getParentNode();
+        while (parent.isPresent()) {
+            Node p = parent.get();
+            if (p instanceof TypeDeclaration<?> td && td.getNameAsString() != null) {
+                names.add(td.getNameAsString());
+            }
+            parent = p.getParentNode();
+        }
+        java.util.Collections.reverse(names);
+        return String.join(".", names);
+    }
+
+    private static boolean paramsMatch(CallableDeclaration<?> m, ParsedSignature sig) {
+        List<Parameter> params = m.getParameters();
+        if (params.size() != sig.paramTypes.size()) return false;
+        for (int i = 0; i < params.size(); i++) {
+            if (!normalize(params.get(i).getType().asString()).equals(normalize(sig.paramTypes.get(i)))) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /** Elimina todo el espacio en blanco para comparar tipos de forma robusta. */
+    private static String normalize(String s) {
+        return s.replaceAll("\\s+", "");
+    }
+
+    /** Signatura parseada: prefijo de clase opcional + nombre + tipos de parámetros. */
+    private record ParsedSignature(String className, String methodName, List<String> paramTypes) {}
+
+    private static ParsedSignature parseSignature(String sig) {
+        int open = sig.indexOf('(');
+        if (open < 0 || !sig.endsWith(")")) {
+            throw new IllegalArgumentException("Firma inválida: " + sig);
+        }
+        String head = sig.substring(0, open);
+        String paramsStr = sig.substring(open + 1, sig.length() - 1);
+
+        String methodName = head;
+        String className = null;
+        int lastDot = head.lastIndexOf('.');
+        if (lastDot >= 0) {
+            className = head.substring(0, lastDot);
+            methodName = head.substring(lastDot + 1);
+        }
+        return new ParsedSignature(className, methodName, splitParams(paramsStr));
+    }
+
+    /**
+     * Divide los tipos de parámetros por comas respetando la profundidad de los
+     * genéricos (&lt; &gt;) y de los paréntesis (p.ej. Function&lt;String, Integer&gt;
+     * o tipos funcionales), para no romper las comas internas.
+     */
+    private static List<String> splitParams(String paramsStr) {
+        List<String> parts = new ArrayList<>();
+        int angle = 0;
+        int paren = 0;
+        StringBuilder current = new StringBuilder();
+        for (char c : paramsStr.toCharArray()) {
+            if (c == '<') angle++;
+            else if (c == '>') angle = Math.max(0, angle - 1);
+            else if (c == '(') paren++;
+            else if (c == ')') paren = Math.max(0, paren - 1);
+
+            if (c == ',' && angle == 0 && paren == 0) {
+                parts.add(current.toString().trim());
+                current.setLength(0);
+            } else {
+                current.append(c);
+            }
+        }
+        if (current.length() > 0) {
+            parts.add(current.toString().trim());
+        }
+        return parts;
     }
 
     /**
@@ -140,6 +451,11 @@ public class ASTAnalyzer {
         m.method_start_line = startLine;
         m.method_end_line   = endLine;
         m.loc               = endLine - startLine + 1;
+        m.method_signature  = signature(method);
+        m.enclosing_class   = enclosingClassPath(method);
+
+        // Complejidad cognitiva (replica local del algoritmo de SonarQube S3776)
+        m.cognitive_complexity = CognitiveComplexityVisitor.computeComplexity(method);
 
         // Recoger todos los statements del cuerpo del método
         List<Statement> allStatements = method.findAll(Statement.class);

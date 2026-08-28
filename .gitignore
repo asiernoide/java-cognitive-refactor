@@ -5,6 +5,7 @@ __pycache__/
 /.venv
 /.env
 /ast-analyzer/target/
+/ast-analyzer/ast-analyzer.jar
 /analysis/
 /notebooks/
 /data/*.csv
