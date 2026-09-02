@@ -8,7 +8,10 @@ import com.github.javaparser.ast.body.ConstructorDeclaration;
 import com.github.javaparser.ast.body.MethodDeclaration;
 import com.github.javaparser.ast.body.TypeDeclaration;
 import com.github.javaparser.ast.stmt.*;
+import com.github.javaparser.ast.expr.BinaryExpr;
+import com.github.javaparser.ast.expr.ConditionalExpr;
 import com.github.javaparser.ast.expr.LambdaExpr;
+import com.github.javaparser.ast.expr.MethodCallExpr;
 import com.github.javaparser.ast.stmt.ReturnStmt;
 import com.github.javaparser.ast.stmt.TryStmt;
 import com.github.javaparser.ast.stmt.SwitchStmt;
@@ -457,6 +460,10 @@ public class ASTAnalyzer {
         // Complejidad cognitiva (replica local del algoritmo de SonarQube S3776)
         m.cognitive_complexity = CognitiveComplexityVisitor.computeComplexity(method);
 
+        // Complejidad ciclomática (McCabe) y proxy de trabajo/allocaciones
+        m.cyclomatic_complexity = cyclomaticComplexity(method);
+        m.method_invocations = method.findAll(MethodCallExpr.class).size();
+
         // Recoger todos los statements del cuerpo del método
         List<Statement> allStatements = method.findAll(Statement.class);
 
@@ -805,6 +812,32 @@ public class ASTAnalyzer {
         return body instanceof BlockStmt block
                 ? block.getStatements()
                 : List.of(body);
+    }
+
+    // -------------------------------------------------------------------------
+    // COMPLEJIDAD CICLOMÁTICA (McCABE)
+    // V(G) = 1 + puntos de decisión. Puntos de decisión:
+    //   if, while, do, for, foreach, case (sin default), catch, ternario (?:)
+    //   y cada operador lógico && / || (cada operador cuenta 1, sin colapsar).
+    // -------------------------------------------------------------------------
+
+    private static int cyclomaticComplexity(CallableDeclaration<?> method) {
+        int cyclo = 1;
+        cyclo += method.findAll(IfStmt.class).size();
+        cyclo += method.findAll(WhileStmt.class).size();
+        cyclo += method.findAll(DoStmt.class).size();
+        cyclo += method.findAll(ForStmt.class).size();
+        cyclo += method.findAll(ForEachStmt.class).size();
+        cyclo += countSwitchCases(method);
+        cyclo += method.findAll(CatchClause.class).size();
+        cyclo += method.findAll(ConditionalExpr.class).size();
+        for (BinaryExpr b : method.findAll(BinaryExpr.class)) {
+            if (b.getOperator() == BinaryExpr.Operator.AND
+                    || b.getOperator() == BinaryExpr.Operator.OR) {
+                cyclo++;
+            }
+        }
+        return cyclo;
     }
 
     // -------------------------------------------------------------------------

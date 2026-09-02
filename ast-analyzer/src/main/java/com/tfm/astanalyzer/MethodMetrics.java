@@ -18,6 +18,12 @@ public class MethodMetrics {
     // calculada sobre el AST con JavaParser (sin necesidad de SonarQube).
     public int cognitive_complexity;
 
+    // --- Complejidad ciclomática (McCabe) y proxy de rendimiento ---
+    // 1 + puntos de decisión (if, bucles, case, catch, ternario, &&/||).
+    public int cyclomatic_complexity;
+    // Nº de llamadas a métodos dentro del método (proxy de trabajo/allocaciones).
+    public int method_invocations;
+
     // --- Tamaño ---
     public int loc;               // Líneas de código (end - start + 1)
     public int statement_count;   // Número de statements con valor semántico

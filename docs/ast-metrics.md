@@ -36,6 +36,8 @@ Además, calcula la `cognitive_complexity` replicando el algoritmo de Cognitive 
 | `branch_count` | int | Número total de ramas en el método: cada `if`, cada `else`, cada `case` de un switch y cada `catch`. Indica la complejidad de flujo independientemente de su profundidad. |
 | `max_if_nesting` | int | Máxima profundidad alcanzada por `if` anidados dentro de otros `if`. Un `else-if` en cadena plana no incrementa la profundidad. Valor 3 o superior suele indicar código difícil de seguir. |
 | `try_catch_count` | int | Número de bloques `try/catch` en el método. Cada bloque es una sección autocontenida candidata natural a **Extract Method**. Dos o más bloques `try/catch` son un indicador muy fuerte. |
+| `cyclomatic_complexity` | int | Complejidad ciclomática de McCabe: `1 + puntos de decisión`. Puntos de decisión: `if`, `while`, `do`, `for`, `foreach`, `case` (sin `default`), `catch`, ternario (`?:`) y cada operador `&&`/`\|` (cada operador cuenta 1, sin colapsar cadenas). Complementa a la CC: permite medir si un refactor reduce la complejidad cognitiva a costa de otras métricas. |
+| `method_invocations` | int | Número de llamadas a métodos dentro del método (proxy de trabajo/allocaciones). Útil para comparar antes/después de un refactor. |
 | `switch_case_count` | int | Número total de etiquetas `case` en todos los bloques `switch` del método. Un `switch` con 5+ casos sugiere **Extract Method** (cada caso a su propio método) o **Replace Conditional with Polymorphism**. |
 
 ---

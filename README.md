@@ -8,8 +8,8 @@ Sistema de detección, clasificación y refactorización automática de métodos
 
 El proyecto se divide en dos fases:
 
-1. **Detección y clasificación** *(implementada)*: el analizador AST (JavaParser) escanea los proyectos **localmente** (modo `scan`), detecta los métodos con `cognitive_complexity > 15` y extrae **17 métricas** por método, incluida la `cognitive_complexity` calculada localmente (ver [Complejidad cognitiva local](#complejidad-cognitiva-local)). Un clasificador determinista (`metrics_classifier.py`) aplica reglas sobre esas métricas para determinar qué técnica de refactorización corresponde. [Más sobre la evolución del enfoque de etiquetado →](docs/labeler-script.md#evolución-del-enfoque-de-etiquetado)
-2. **Refactorización automática** *(en desarrollo)*: un LLM aplicará la técnica recomendada generando el código refactorizado. El analizador localiza los métodos por **signatura** (`nombre + tipos de parámetros`, único dentro de una clase) además de por línea, porque tras un refactor las líneas cambian.
+1. **Detección y clasificación** *(implementada)*: el analizador AST (JavaParser) escanea los proyectos **localmente** (modo `scan`), detecta los métodos con `cognitive_complexity > 15` y extrae **19 métricas** por método, incluida la `cognitive_complexity` calculada localmente (ver [Complejidad cognitiva local](#complejidad-cognitiva-local)). Un clasificador determinista (`metrics_classifier.py`) aplica reglas sobre esas métricas para determinar qué técnica de refactorización corresponde. [Más sobre la evolución del enfoque de etiquetado →](docs/labeler-script.md#evolución-del-enfoque-de-etiquetado)
+2. **Refactorización automática** *(en desarrollo)*: un LLM aplica las técnicas recomendadas sobre **copias de trabajo** de los proyectos (ver `lib/workspace.py`). Para cada método con técnicas etiquetadas (1s en el dataset) se intenta **cada técnica por separado**: el LLM genera el código, se aplica en la copia, se miden las métricas (CC, ciclomática, invocations) y se **deshace el cambio con git**. De todas las versiones se conserva la de **menor complejidad cognitiva** (empate → menor ciclomática; empate → aleatorio con semilla fija), se aplica de forma permanente y se commitea en la copia. La detección/medición usa el analizador local; la localización de métodos se hace por **signatura** (`nombre + tipos de parámetros`), única dentro de una clase, porque tras un refactor las líneas cambian.
 
 ![Pipeline del TFM](docs/images/pipeline.png)
 
@@ -43,10 +43,13 @@ La métrica `cognitive_complexity` se calcula **localmente** con JavaParser, rep
 ```
 java-cognitive-refactor/
 ├── main.py                       # Pipeline principal (detección local → CSV)
+├── refactor_loop.py              # Bucle de refactorización con LLM (C3)
 ├── metrics_classifier.py         # Clasificador basado en reglas sobre métricas
 │
 ├── lib/
-│   └── ast_analyzer.py           # Wrapper del analizador AST (Java)
+│   ├── ast_analyzer.py           # Wrapper del analizador AST (Java)
+│   ├── llm_client.py             # Cliente LLM OpenAI-compatible
+│   └── workspace.py              # Copias de trabajo (out/) para refactor
 │
 ├── ast-analyzer/                 # Módulo Java (Maven + JavaParser)
 │   ├── pom.xml
@@ -97,7 +100,27 @@ Copia `.env.example` a `.env` y rellena los valores:
 PROJECTS_DIR=projects
 DATA_DIR=data
 CC_THRESHOLD=15
+WORK_DIR=out
+REFACTOR_CYCLO_PENALTY=1
+REFACTOR_MAX_CYCLO_DELTA_PCT=0
+LLM_BASE_URL=https://opencode.ai/zen/go/v1
+LLM_API_KEY=your_api_key_here
+LLM_MODEL=deepseek-v4-flash
+LLM_TEMPERATURE=0.2
+LLM_MAX_TOKENS=2048
+LLM_TIMEOUT=120
+LLM_REASONING_EFFORT=high
 ```
+
+Las claves `LLM_*` configuran el cliente OpenAI-compatible (`lib/llm_client.py`) usado en la fase de refactorización con LLM: `LLM_BASE_URL` y `LLM_API_KEY` cambian según el proveedor (OpenAI, OpenRouter, Ollama, OpenCode Go…); `LLM_MODEL` es el nombre del modelo. `LLM_REASONING_EFFORT` (p.ej. `high`/`low` en DeepSeek V4) fija el esfuerzo de razonamiento de los modelos con *thinking*; si se deja vacío, no se envía el parámetro.
+
+`WORK_DIR` es el directorio donde se crean las **copias de trabajo** (clones locales) de los proyectos para refactorizar sin tocar `projects/` (ver `lib/workspace.py`).
+
+La selección de la mejor versión refactorizada usa un **score con penalización** de la ciclomática:
+
+$$S(c) = \Delta CC(c) - \lambda \cdot \max\big(0,\ \Delta Cyclo(c)\big)$$
+
+`REFACTOR_CYCLO_PENALTY` es `λ` (default `1`; `0` = seleccionar solo por CC). Se elige el candidato de mayor `S` y solo se aplica si `S > 0` (si no, se mantiene el original). `REFACTOR_MAX_CYCLO_DELTA_PCT` queda como **red de seguridad opcional** (`0` = desactivado). Se controlan junto a `CC_THRESHOLD` (complejidad cognitiva). Las fórmulas están documentadas en la nota Semana 10 (Obsidian).
 
 ---
 
@@ -128,7 +151,15 @@ python metrics_classifier.py
 
 Aplica reglas deterministas sobre las métricas del CSV para predecir refactorizaciones. El CSV de salida se guarda en `analysis/output/`.
 
-### 4. Escanear un proyecto (detección local) y analizar por signatura
+### 4. Bucle de refactorización con LLM
+
+```bash
+python refactor_loop.py [--project <proyecto>] [--limit N] [--dry-run]
+```
+
+Crea copias de trabajo de los proyectos (`WORK_DIR`, default `out/`) y, para cada método del dataset con técnicas etiquetadas, intenta cada técnica con el LLM: aplica → mide (CC, ciclomática, invocations) → **deshace con git**. La mejor versión se elige por el **score penalizado** `S = ΔCC − λ·max(0, ΔCyclo)` (ver [Configuración](#configuración)): solo se aplica y commitea si `S > 0`, si no se mantiene el original. `--dry-run` no deja cambios ni commits. El detalle de cada intento (con su score) se registra en `data/refactor_log.jsonl`. Config: `WORK_DIR`, `CC_THRESHOLD`, `REFACTOR_CYCLO_PENALTY`, `REFACTOR_MAX_CYCLO_DELTA_PCT` (0 = sin límite), `REFACTOR_SEED`, `REFACTOR_RUN_TESTS` (`never`/`auto`/`always`, cronometra la suite de tests del proyecto antes/después del pase).
+
+### 5. Escanear un proyecto (detección local) y analizar por signatura
 
 ```bash
 # Escaneo local: métodos con cognitive_complexity > umbral (15 por defecto)
@@ -190,6 +221,6 @@ python data/aggregate_method_data.py
 
 El dataset agregado contiene 26 columnas: 5 de identificación (`file`, `method_name`, `method_start_line`, `method_end_line`, `cognitive_complexity`), 16 métricas estructurales extraídas del AST, y 5 columnas de refactorización.
 
-El analizador AST devuelve 17 métricas por método: las 16 estructurales más `cognitive_complexity` (calculada localmente replicando el algoritmo de Cognitive Complexity de SonarSource; ver [Complejidad cognitiva local](#complejidad-cognitiva-local)). Además, incluye `method_signature` (nombre + tipos de parámetros) y `enclosing_class` (clase contenedora), necesarias para localizar métodos por signatura tras un refactor.
+El analizador AST devuelve 19 métricas por método: las 18 estructurales más `cognitive_complexity` (calculada localmente replicando el algoritmo de Cognitive Complexity de SonarSource; ver [Complejidad cognitiva local](#complejidad-cognitiva-local)). Entre las estructurales se incluyen la `cyclomatic_complexity` (McCabe) y `method_invocations` (proxy de trabajo), útiles para medir el impacto del refactor en otras métricas. Además, incluye `method_signature` (nombre + tipos de parámetros) y `enclosing_class` (clase contenedora), necesarias para localizar métodos por signatura tras un refactor.
 
 La documentación detallada de cada métrica está en [docs/ast-metrics.md](docs/ast-metrics.md).
