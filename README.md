@@ -103,6 +103,10 @@ CC_THRESHOLD=15
 WORK_DIR=out
 REFACTOR_CYCLO_PENALTY=1
 REFACTOR_MAX_CYCLO_DELTA_PCT=0
+REFACTOR_MAX_TOKENS=24000
+REFACTOR_MODE=stream
+REFACTOR_BATCH_MAX_TOKENS=30000
+REFACTOR_BATCH_TIMEOUT=1800
 LLM_BASE_URL=https://opencode.ai/zen/go/v1
 LLM_API_KEY=your_api_key_here
 LLM_MODEL=deepseek-v4-flash
@@ -120,7 +124,11 @@ La selección de la mejor versión refactorizada usa un **score con penalizació
 
 $$S(c) = \Delta CC(c) - \lambda \cdot \max\big(0,\ \Delta Cyclo(c)\big)$$
 
-`REFACTOR_CYCLO_PENALTY` es `λ` (default `1`; `0` = seleccionar solo por CC). Se elige el candidato de mayor `S` y solo se aplica si `S > 0` (si no, se mantiene el original). `REFACTOR_MAX_CYCLO_DELTA_PCT` queda como **red de seguridad opcional** (`0` = desactivado). Se controlan junto a `CC_THRESHOLD` (complejidad cognitiva). Las fórmulas están documentadas en la nota Semana 10 (Obsidian).
+`REFACTOR_CYCLO_PENALTY` es `λ` (default `1`; `0` = seleccionar solo por CC). Se elige el candidato de mayor `S` y solo se aplica si `S > 0` (si no, se mantiene el original). `REFACTOR_MAX_CYCLO_DELTA_PCT` queda como **red de seguridad opcional** (`0` = desactivado). Se controlan junto a `CC_THRESHOLD` (complejidad cognitiva). `REFACTOR_MAX_TOKENS` fija el máx. de tokens de salida por llamada en el refactor (default `24000`; los métodos grandes necesitan más que `LLM_MAX_TOKENS`). Las fórmulas están documentadas en la nota Semana 10 (Obsidian).
+
+En **Extract Method**, la CC/Ciclomática del candidato se mide como **total = método principal + suma de los métodos extraídos** (si solo se midiera el principal, extraer lógica a sub-métodos reduciría la CC artificialmente). Así, la extracción solo se acepta si el total mejora al original.
+
+`REFACTOR_MODE` elige cómo se hacen las llamadas LLM: `stream` (default) hace **una llamada por técnica y método**; `batch` agrupa varios métodos en **una sola llamada** (JSON: entrada `{"methods":[{id, signature, techniques, source}]}` → salida `{"refactors":[{id, technique, main_method, new_methods}]}`) y luego evalúa cada candidato con los mismos criterios (`select_best`, log). El modo batch elimina el overhead fijo por petición y la duplicación de llamadas por técnica: para la API de OpenCode Go es lo recomendable (la generación en stream es ~70-80 tok/s y es el límite real). `REFACTOR_BATCH_MAX_TOKENS` es el presupuesto de tokens por llamada (default `30000`, ~3-5 métodos; valores de ~60k generan respuestas de muchos minutos que el gateway corta de forma intermitente) y `REFACTOR_BATCH_TIMEOUT` el timeout de esa llamada (default `1800`s). Las llamadas del batch usan **streaming** (el gateway cierra las respuestas no-streaming que tardan demasiado).
 
 ---
 

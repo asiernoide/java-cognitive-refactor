@@ -19,6 +19,9 @@ Config (.env):
     REFACTOR_MAX_CYCLO_DELTA_PCT red de seguridad opcional: % de aumento de
                                  ciclomática permitido (0 = sin límite)
     REFACTOR_SEED                semilla para el empate aleatorio (default 42)
+    REFACTOR_MAX_TOKENS          máx. tokens de salida por llamada al LLM en el
+                                 refactor (default 24000; los métodos grandes
+                                 necesitan más que LLM_MAX_TOKENS)
     REFACTOR_RUN_TESTS           never/auto/always: cronometrar la suite de
                                  tests del proyecto antes/después del pase
     LLM_*                        cliente OpenAI-compatible (lib/llm_client.py)
@@ -40,6 +43,7 @@ import os
 import random
 import re
 import subprocess
+import tempfile
 import time
 from pathlib import Path
 
@@ -58,7 +62,17 @@ CC_THRESHOLD = int(os.getenv("CC_THRESHOLD", "15"))
 CYCLO_PENALTY = float(os.getenv("REFACTOR_CYCLO_PENALTY", "1"))
 MAX_CYCLO_DELTA_PCT = float(os.getenv("REFACTOR_MAX_CYCLO_DELTA_PCT", "0"))
 SEED = int(os.getenv("REFACTOR_SEED", "42"))
+REFACTOR_MAX_TOKENS = int(os.getenv("REFACTOR_MAX_TOKENS", "24000"))
 RUN_TESTS = os.getenv("REFACTOR_RUN_TESTS", "never")
+# Modo de trabajo: "stream" = una llamada LLM por método (por defecto);
+# "batch" = agrupa varios métodos en UNA llamada (más barato en latencia).
+REFACTOR_MODE = os.getenv("REFACTOR_MODE", "stream")
+# Presupuesto de tokens por llamada en modo batch (input+output objetivo).
+# Valores grandes (~60k) generan respuestas de muchos minutos que el gateway
+# corta de forma intermitente; 20k-30k (~3-5 métodos por llamada) es lo fiable.
+REFACTOR_BATCH_MAX_TOKENS = int(os.getenv("REFACTOR_BATCH_MAX_TOKENS", "30000"))
+# Timeout por llamada en modo batch (la generación de un lote tarda minutos).
+REFACTOR_BATCH_TIMEOUT = int(os.getenv("REFACTOR_BATCH_TIMEOUT", "1800"))
 
 TARGETS = [
     "refactor_extract_method",
@@ -107,8 +121,113 @@ SYSTEM_PROMPT_JSON = (
     "method declarations). No other text, no markdown."
 )
 
+SYSTEM_PROMPT_BATCH = (
+    "You are an expert Java refactoring assistant specialized in reducing cognitive "
+    "complexity. You receive a JSON object with an array of Java methods to refactor. "
+    "Respond ONLY with a JSON object with a single field \"refactors\": an array of "
+    "entries. For EVERY method id, provide ONE entry for EACH technique in its "
+    "\"techniques\" array (e.g. if a method lists 2 techniques, output 2 entries for it). "
+    "Each entry must be a JSON object with exactly: \"id\" (the input method id, an "
+    "integer), \"technique\" (one of the allowed techniques for that method), "
+    "\"main_method\" (the refactored original method as a single Java method declaration "
+    "with the exact same signature as the input), and \"new_methods\" (an array of new "
+    "private Java method declarations; an empty array when the technique is not Extract "
+    "Method). Preserve the behavior of every method exactly. No text outside the JSON."
+)
+
 RNG = random.Random(SEED)
 LOG_PATH = DATA_DIR / "refactor_log.jsonl"
+
+
+# ---------------------------------------------------------------------------
+# Progreso en vivo y reanudación
+# ---------------------------------------------------------------------------
+
+def fmt_eta(seconds: float) -> str:
+    s = int(seconds)
+    return "%dh%02dm" % (s // 3600, (s % 3600) // 60)
+
+
+class Progress:
+    """Progreso en vivo del bucle: una línea con \\r en terminal y una línea de
+    control (checkpoint) cada N métodos para poder seguir el avance desde el
+    fichero de salida cuando se ejecuta en segundo plano."""
+
+    def __init__(self, total: int, labeled_total: int, checkpoint_every: int = 25):
+        self.total = total
+        self.labeled_total = labeled_total
+        self.checkpoint_every = checkpoint_every
+        self.processed = 0
+        self.labeled_done = 0
+        self.resume_skipped = 0
+        self.counts = {}
+        self.t0 = time.time()
+        self._last = 0.0
+
+    def update(self, status: str, labeled: bool = False, resumed: bool = False):
+        self.processed += 1
+        if resumed:
+            self.resume_skipped += 1
+        elif labeled:
+            self.labeled_done += 1
+        self.counts[status] = self.counts.get(status, 0) + 1
+        self._render_live()
+        if self.processed % self.checkpoint_every == 0:
+            self._render_checkpoint()
+
+    def _counts_str(self) -> str:
+        parts = ["%s=%d" % (k, v) for k, v in sorted(self.counts.items())]
+        if self.resume_skipped:
+            parts.append("reanudados=%d" % self.resume_skipped)
+        return " ".join(parts)
+
+    def _rate(self):
+        elapsed = time.time() - self.t0
+        return self.processed / elapsed if elapsed > 0 else 0.0, elapsed
+
+    def _eta(self):
+        rate, _ = self._rate()
+        if rate <= 0:
+            return "?"
+        return fmt_eta((self.total - self.processed) / rate)
+
+    def _render_live(self):
+        now = time.time()
+        if now - self._last < 2:
+            return
+        self._last = now
+        rate, elapsed = self._rate()
+        print("\r[%s] %d/%d métodos (%d con técnica) | ETA %s | %s     " % (
+            fmt_eta(elapsed), self.processed, self.total, self.labeled_done,
+            self._eta(), self._counts_str()), end="", flush=True)
+
+    def _render_checkpoint(self):
+        _, elapsed = self._rate()
+        print("\n[CHECKPOINT] %d/%d métodos (%d con técnica) | transcurrido %s | ETA %s | %s"
+              % (self.processed, self.total, self.labeled_done, fmt_eta(elapsed),
+                 self._eta(), self._counts_str()), flush=True)
+
+    def finish(self):
+        print("\n--- Fin del bucle ---")
+        print(self._counts_str(), flush=True)
+
+
+def load_done_keys() -> set[tuple[str, str, int]]:
+    """Conjunto de métodos ya procesados (project, file, start_line) a partir de
+    las entradas del log con campo `status` (marcan el final del procesamiento
+    de un método). Permite reanudar sin repetir trabajo ni gastar tokens."""
+    keys = set()
+    if not LOG_PATH.exists():
+        return keys
+    with open(LOG_PATH, encoding="utf-8") as f:
+        for line in f:
+            try:
+                e = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if e.get("status") and e.get("start_line") is not None:
+                keys.add((e["project"], e["file"], int(e["start_line"])))
+    return keys
 
 
 # ---------------------------------------------------------------------------
@@ -196,10 +315,32 @@ def extract_source(full_path: Path, base: dict) -> str:
     return "".join(lines[start - 1:end])
 
 
+def measure_method_snippet(source: str) -> dict | None:
+    """Mide CC/ciclomática/LOC/invocations de un método aislado (p.ej. un método
+    extraído por Extract Method) envolviéndolo en una clase temporal. Devuelve
+    las métricas o None si no parsea."""
+    code = "class T {\n" + source + "\n}\n"
+    tmp = None
+    try:
+        with tempfile.NamedTemporaryFile("w", suffix=".java", delete=False,
+                                         encoding="utf-8") as f:
+            f.write(code)
+            tmp = f.name
+        return ast.analyze_method(tmp, 2)
+    finally:
+        if tmp:
+            os.unlink(tmp)
+
+
 def try_technique(client, project: str, work_path: Path, rel_file: str, base: dict,
-                  technique: str) -> dict | None:
+                  technique: str, locate_sig: str) -> dict | None:
     """Aplica una técnica: LLM -> aplicar -> medir -> deshacer. Devuelve el
-    candidato con métricas, o None si el LLM no produjo algo válido."""
+    candidato con métricas, o None si el LLM no produjo algo válido.
+
+    `locate_sig` es la firma cualificada (enclosing_class.method_signature),
+    única dentro del fichero y estable ante refactors; se usa para re-localizar
+    el método tras aplicar el cambio (la firma simple puede ser ambigua en
+    clases internas y las líneas cambian tras el refactor)."""
     full_path = work_path / rel_file
     source = extract_source(full_path, base)
     signature = base["method_signature"]
@@ -215,7 +356,7 @@ def try_technique(client, project: str, work_path: Path, rel_file: str, base: di
             data, usage = client.chat_json([
                 {"role": "system", "content": system},
                 {"role": "user", "content": user},
-            ])
+            ], max_tokens=REFACTOR_MAX_TOKENS)
         except llm_client.LLMError as e:
             log_entry(project=project, file=rel_file, signature=signature,
                       technique=technique, reason=f"LLM error: {e}", valid=False)
@@ -233,7 +374,7 @@ def try_technique(client, project: str, work_path: Path, rel_file: str, base: di
             content, usage = client.chat([
                 {"role": "system", "content": system},
                 {"role": "user", "content": user},
-            ])
+            ], max_tokens=REFACTOR_MAX_TOKENS)
         except llm_client.LLMError as e:
             log_entry(project=project, file=rel_file, signature=signature,
                       technique=technique, reason=f"LLM error: {e}", valid=False)
@@ -241,11 +382,40 @@ def try_technique(client, project: str, work_path: Path, rel_file: str, base: di
         main_code = clean_code(content)
         new_methods = []
 
+    # Guard: rechazar salidas vacías o que no parecen un método Java
+    if not main_code.strip() or len(main_code.strip()) < 20 or "(" not in main_code or "{" not in main_code:
+        log_entry(project=project, file=rel_file, signature=signature,
+                  technique=technique, reason="salida del LLM vacía o demasiado corta",
+                  valid=False)
+        return None
+
+    tokens = (usage or {}).get("total_tokens", 0)
+    return evaluate_candidate(work_path, rel_file, base, locate_sig, technique,
+                              main_code, new_methods, project, tokens=tokens)
+
+
+def evaluate_candidate(work_path: Path, rel_file: str, base: dict, locate_sig: str,
+                       technique: str, main_code: str, new_methods: list,
+                       project: str, tokens: int = 0) -> dict | None:
+    """Aplica el candidato a la copia, mide, revierte y devuelve el dict del
+    candidato. Comparte la medición con el modo stream y el modo batch.
+    None si no valida (no parsea o cambia la firma).
+
+    CC/Ciclomática EFECTIVA: para Extract Method se suma la complejidad de los
+    métodos extraídos (si solo se midiera el método principal, la extracción
+    permitiría reducir la CC artificialmente "escondiendo" la lógica en
+    sub-métodos). Sin esa suma, el total podría incluso aumentar.
+    """
+    full_path = work_path / rel_file
+    signature = base["method_signature"]
+
     if not apply_candidate(full_path, base, main_code, new_methods):
         return None
 
-    # Medir tras el cambio (esto también valida que el archivo parsea)
-    measured = ast.analyze_method_by_signature(str(full_path), signature)
+    # Medir tras el cambio (esto también valida que el archivo parsea).
+    # Se re-localiza por la firma CUALIFICADA (estable ante cambios de línea y
+    # sin ambigüedad de clases internas), no por la línea original.
+    measured = ast.analyze_method_by_signature(str(full_path), locate_sig)
     workspace.git_restore(work_path, rel_file)  # deshacer el cambio
 
     if measured is None:
@@ -258,16 +428,34 @@ def try_technique(client, project: str, work_path: Path, rel_file: str, base: di
                   technique=technique, reason="la firma cambió", valid=False)
         return None
 
-    tokens = (usage or {}).get("total_tokens", 0)
+    main_cc = int(measured["cognitive_complexity"])
+    main_cyclo = int(measured["cyclomatic_complexity"])
+    extracted_cc = 0
+    extracted_cyclo = 0
+    extracted_loc = 0
+    extracted_inv = 0
+    if technique == "refactor_extract_method":
+        for nm in new_methods:
+            m = measure_method_snippet(nm)
+            if m is not None:
+                extracted_cc += int(m["cognitive_complexity"])
+                extracted_cyclo += int(m["cyclomatic_complexity"])
+                extracted_loc += int(m["loc"])
+                extracted_inv += int(m["method_invocations"])
+
     return {
         "technique": technique,
-        "cc": int(measured["cognitive_complexity"]),
-        "cyclo": int(measured["cyclomatic_complexity"]),
-        "loc": int(measured["loc"]),
-        "invocations": int(measured["method_invocations"]),
+        "cc": main_cc + extracted_cc,
+        "cyclo": main_cyclo + extracted_cyclo,
+        "loc": int(measured["loc"]) + extracted_loc,
+        "invocations": int(measured["method_invocations"]) + extracted_inv,
         "tokens": tokens,
         "code": main_code,
         "new_methods": new_methods,
+        "main_cc": main_cc,
+        "extracted_cc": extracted_cc,
+        "main_cyclo": main_cyclo,
+        "extracted_cyclo": extracted_cyclo,
     }
 
 
@@ -345,24 +533,52 @@ def run_tests_timed(project_path: Path) -> dict | None:
 # Bucle principal
 # ---------------------------------------------------------------------------
 
-def process_method(project: str, work_path: Path, row, client, dry_run: bool, stats: dict):
+def process_method(project: str, work_path: Path, row, client, dry_run: bool, stats: dict) -> str:
+    """Procesa un método y devuelve su estado (checkpoint de reanudación)."""
     rel_file = str(row["file"])
+    start_line = int(row["method_start_line"])
     full_path = work_path / rel_file
     if not full_path.is_file():
         stats["skipped_no_file"] += 1
-        return
+        log_entry(project=project, file=rel_file, start_line=start_line,
+                  status="no_file", reason="archivo no existe en la copia")
+        return "no_file"
 
     techniques = [t for t in TARGETS if int(row.get(t) or 0) == 1]
     if not techniques:
         stats["skipped_no_technique"] += 1
-        return
+        log_entry(project=project, file=rel_file, start_line=start_line,
+                  status="no_technique")
+        return "no_technique"
 
-    base = ast.analyze_method(str(full_path), int(row["method_start_line"]))
+    # Identidad ESTABLE del método desde el proyecto ORIGINAL (nunca modificado):
+    # la línea del CSV del dataset solo es válida en el original; la copia de
+    # trabajo puede haber cambiado de líneas tras refactors previos en el mismo
+    # archivo. La firma cualificada (enclosing_class.method_signature) es única
+    # dentro del fichero (desambigua clases internas, p.ej. JSONPath.SizeSegment)
+    # y no cambia con los refactors.
+    orig_path = Path(PROJECTS_DIR) / project / rel_file
+    orig_meta = ast.analyze_method(str(orig_path), start_line)
+    if orig_meta is None:
+        stats["skipped_not_found"] += 1
+        log_entry(project=project, file=rel_file, start_line=start_line,
+                  technique="any", reason="método no localizado en el proyecto original",
+                  status="not_found", valid=False)
+        return "not_found"
+
+    enclosing = orig_meta.get("enclosing_class") or ""
+    locate_sig = f"{enclosing}.{orig_meta['method_signature']}" if enclosing \
+        else orig_meta["method_signature"]
+
+    # Localizar en la COPIA por firma cualificada (estable ante cambios de línea)
+    base = ast.analyze_method_by_signature(str(full_path), locate_sig)
     if base is None:
         stats["skipped_not_found"] += 1
-        log_entry(project=project, file=rel_file, technique="any",
-                  reason="método no localizado en la copia", valid=False)
-        return
+        log_entry(project=project, file=rel_file, start_line=start_line,
+                  signature=orig_meta["method_signature"],
+                  reason="método no localizado en la copia (firma cualificada)",
+                  status="not_found", valid=False)
+        return "not_found"
 
     signature = base["method_signature"]
     base_cc = int(base["cognitive_complexity"])
@@ -370,16 +586,27 @@ def process_method(project: str, work_path: Path, row, client, dry_run: bool, st
 
     candidates = []
     for t in techniques:
-        cand = try_technique(client, project, work_path, rel_file, base, t)
+        cand = try_technique(client, project, work_path, rel_file, base, t, locate_sig)
         if cand is not None:
             candidates.append(cand)
         stats["candidates"] += 1
 
+    return finalize_method(project, work_path, rel_file, start_line, signature,
+                           locate_sig, base_cc, base_cyclo, candidates, dry_run, stats)
+
+
+def finalize_method(project: str, work_path: Path, rel_file: str, start_line: int,
+                    signature: str, locate_sig: str, base_cc: int, base_cyclo: int,
+                    candidates: list[dict], dry_run: bool, stats: dict) -> str:
+    """Decide y aplica el mejor candidato con nuestros criterios (mismo flujo para
+    modo stream y batch): selección por score, aplicación permanente, commit, log."""
     if not candidates:
         stats["no_valid_candidate"] += 1
-        log_entry(project=project, file=rel_file, signature=signature,
-                  base_cc=base_cc, reason="ninguna técnica generó un candidato válido")
-        return
+        log_entry(project=project, file=rel_file, start_line=start_line,
+                  signature=signature, base_cc=base_cc,
+                  reason="ninguna técnica generó un candidato válido",
+                  status="no_valid_candidate")
+        return "no_valid_candidate"
 
     # Red de seguridad opcional: cap porcentual de ciclomática (0 = sin límite)
     if MAX_CYCLO_DELTA_PCT > 0:
@@ -388,40 +615,50 @@ def process_method(project: str, work_path: Path, row, client, dry_run: bool, st
                    if (c["cyclo"] - ref_cyclo) / ref_cyclo * 100 <= MAX_CYCLO_DELTA_PCT]
         if allowed:
             candidates = allowed
-            log_entry(project=project, file=rel_file, signature=signature,
-                      base_cc=base_cc, base_cyclo=base_cyclo,
+            log_entry(project=project, file=rel_file, start_line=start_line,
+                      signature=signature, base_cc=base_cc, base_cyclo=base_cyclo,
                       reason=f"descartados candidatos con Δciclomática > {MAX_CYCLO_DELTA_PCT}%")
         else:
             stats["kept_original"] += 1
-            log_entry(project=project, file=rel_file, signature=signature,
-                      base_cc=base_cc, base_cyclo=base_cyclo,
-                      decision="keep_original",
+            log_entry(project=project, file=rel_file, start_line=start_line,
+                      signature=signature, base_cc=base_cc, base_cyclo=base_cyclo,
+                      status="keep_original", decision="keep_original",
                       reason="todos los candidatos superan el límite de ciclomática (safety)")
-            return
+            return "keep_original"
 
     # Selección por score penalizado: S = ΔCC − λ·max(0, ΔCyclo)
     best, score = select_best(candidates, base_cc, base_cyclo)
 
     for c in candidates:
-        log_entry(project=project, file=rel_file, signature=signature,
-                  technique=c["technique"], base_cc=base_cc, base_cyclo=base_cyclo,
+        log_entry(project=project, file=rel_file, start_line=start_line,
+                  signature=signature, technique=c["technique"],
+                  base_cc=base_cc, base_cyclo=base_cyclo,
                   candidate_cc=c["cc"], candidate_cyclo=c["cyclo"],
                   candidate_loc=c["loc"], candidate_invocations=c["invocations"],
+                  main_cc=c.get("main_cc"), extracted_cc=c.get("extracted_cc"),
+                  main_cyclo=c.get("main_cyclo"), extracted_cyclo=c.get("extracted_cyclo"),
                   score=c.get("score"), tokens=c["tokens"],
                   valid=True, kept=(c is best))
 
     if score <= 0:
         stats["kept_original"] += 1
-        log_entry(project=project, file=rel_file, signature=signature,
-                  base_cc=base_cc, base_cyclo=base_cyclo,
-                  decision="keep_original",
+        log_entry(project=project, file=rel_file, start_line=start_line,
+                  signature=signature, base_cc=base_cc, base_cyclo=base_cyclo,
+                  status="keep_original", decision="keep_original",
                   reason=f"ninguna versión merece la pena (mejor score {score:.2f} <= 0)")
-        return
+        return "keep_original"
 
-    # Aplicar la mejor versión de forma permanente
-    if not apply_candidate(full_path, base, best["code"], best["new_methods"]):
+    # Re-localizar el método en la copia justo antes de aplicar: en modo batch
+    # varios métodos del mismo fichero pueden haberse aplicado antes y desplazar
+    # las líneas; la firma cualificada es estable ante esos cambios.
+    full_path = work_path / rel_file
+    current = ast.analyze_method_by_signature(str(full_path), locate_sig)
+    if current is None or not apply_candidate(full_path, current, best["code"], best["new_methods"]):
         stats["apply_failed"] += 1
-        return
+        log_entry(project=project, file=rel_file, start_line=start_line,
+                  signature=signature, status="apply_failed",
+                  reason="no se pudo aplicar el cambio")
+        return "apply_failed"
 
     if dry_run:
         workspace.git_restore(work_path, rel_file)
@@ -436,13 +673,136 @@ def process_method(project: str, work_path: Path, row, client, dry_run: bool, st
         decision = "kept+commit"
         stats["kept_committed"] += 1
 
-    log_entry(project=project, file=rel_file, signature=signature,
-              base_cc=base_cc, base_cyclo=base_cyclo,
+    log_entry(project=project, file=rel_file, start_line=start_line,
+              signature=signature, base_cc=base_cc, base_cyclo=base_cyclo,
+              status="kept", decision=decision,
               technique=best["technique"], candidate_cc=best["cc"],
               candidate_cyclo=best["cyclo"], candidate_loc=best["loc"],
               candidate_invocations=best["invocations"],
-              decision=decision)
+              score=best.get("score"))
     stats["methods_refactored"] += 1
+    return "kept"
+
+
+def batch_entry(project: str, work_path: Path, row) -> tuple[dict | None, str | None]:
+    """Prepara un método para el modo batch. Devuelve (entry, error) donde error
+    es el estado si el método no puede entrar en el batch (no_file, no_technique,
+    not_found) o None si entra. La source se toma del proyecto ORIGINAL (baseline):
+    los métodos de un batch no se han refactorizado aún, por lo que la copia de
+    trabajo está idéntica al original."""
+    rel_file = str(row["file"])
+    start_line = int(row["method_start_line"])
+    full_path = work_path / rel_file
+    if not full_path.is_file():
+        return None, "no_file"
+    techniques = [t for t in TARGETS if int(row.get(t) or 0) == 1]
+    if not techniques:
+        return None, "no_technique"
+
+    orig_path = Path(PROJECTS_DIR) / project / rel_file
+    orig_meta = ast.analyze_method(str(orig_path), start_line)
+    if orig_meta is None:
+        return None, "not_found"
+    enclosing = orig_meta.get("enclosing_class") or ""
+    locate_sig = f"{enclosing}.{orig_meta['method_signature']}" if enclosing \
+        else orig_meta["method_signature"]
+
+    base = ast.analyze_method_by_signature(str(full_path), locate_sig)
+    if base is None:
+        return None, "not_found"
+
+    return {
+        "project": project,
+        "rel_file": rel_file,
+        "start_line": start_line,
+        "signature": base["method_signature"],
+        "locate_sig": locate_sig,
+        "techniques": techniques,
+        "source": extract_source(orig_path, orig_meta),
+        "base": base,
+        "base_cc": int(base["cognitive_complexity"]),
+        "base_cyclo": int(base["cyclomatic_complexity"]),
+    }, None
+
+
+def _batch_tokens(entries: list[dict]) -> int:
+    """Estimación aproximada de tokens de entrada del batch (chars//3 + 200)."""
+    return sum(len(e["source"]) // 3 + 200 for e in entries)
+
+
+def process_batch(client, work_path: Path, entries: list[dict], dry_run: bool,
+                  stats: dict) -> list[str]:
+    """Procesa un lote de métodos con UNA sola llamada LLM (JSON):
+        in  -> {"methods": [{id, signature, techniques, source}, ...]}
+        out -> {"refactors": [{id, technique, main_method, new_methods}, ...]}
+    Después evalúa cada candidato localmente con nuestros criterios (mismo
+    select_best / log que el modo stream) y aplica los aceptados."""
+    project = entries[0]["project"]
+    methods_payload = [
+        {"id": i, "signature": e["signature"], "techniques": e["techniques"],
+         "source": e["source"]}
+        for i, e in enumerate(entries)
+    ]
+    user = json.dumps({"methods": methods_payload}, ensure_ascii=False)
+
+    data, usage = None, None
+    for attempt in range(3):
+        try:
+            data, usage = client.chat_json([
+                {"role": "system", "content": SYSTEM_PROMPT_BATCH},
+                {"role": "user", "content": user},
+            ], max_tokens=REFACTOR_BATCH_MAX_TOKENS, timeout=REFACTOR_BATCH_TIMEOUT,
+               stream=True)
+            break
+        except llm_client.LLMError as e:
+            stats["llm_errors"] += 1
+            log_entry(event="batch", project=project, methods=len(entries),
+                      reason=f"LLM error: {e}")
+            time.sleep(3 ** attempt)
+    if data is None:
+        for e in entries:
+            stats["no_valid_candidate"] += 1
+            log_entry(project=e["project"], file=e["rel_file"], start_line=e["start_line"],
+                      signature=e["signature"], base_cc=e["base_cc"],
+                      reason="error de LLM en el batch", status="no_valid_candidate")
+        return ["no_valid_candidate"] * len(entries)
+
+    batch_tokens = (usage or {}).get("total_tokens", 0)
+    log_entry(event="llm_batch", project=project, methods=len(entries),
+              tokens=batch_tokens)
+
+    by_id: dict[int, list[dict]] = {}
+    for r in (data or {}).get("refactors") or []:
+        if isinstance(r, dict) and isinstance(r.get("id"), int):
+            by_id.setdefault(r["id"], []).append(r)
+
+    statuses = []
+    for i, e in enumerate(entries):
+        candidates = []
+        for r in by_id.get(i, []):
+            technique = r.get("technique")
+            main_code = r.get("main_method") or ""
+            new_methods = r.get("new_methods") or []
+            if technique not in e["techniques"]:
+                continue
+            if not main_code.strip() or len(main_code.strip()) < 20 \
+                    or "(" not in main_code or "{" not in main_code:
+                log_entry(project=e["project"], file=e["rel_file"],
+                          start_line=e["start_line"], signature=e["signature"],
+                          technique=technique,
+                          reason="salida del LLM vacía o demasiado corta", valid=False)
+                continue
+            cand = evaluate_candidate(work_path, e["rel_file"], e["base"], e["locate_sig"],
+                                      technique, main_code, new_methods, e["project"],
+                                      tokens=batch_tokens)
+            if cand is not None:
+                candidates.append(cand)
+            stats["candidates"] += 1
+        statuses.append(finalize_method(e["project"], work_path, e["rel_file"],
+                                        e["start_line"], e["signature"], e["locate_sig"],
+                                        e["base_cc"], e["base_cyclo"], candidates,
+                                        dry_run, stats))
+    return statuses
 
 
 def main():
@@ -451,6 +811,8 @@ def main():
     parser.add_argument("--limit", type=int, help="Máximo de métodos a procesar")
     parser.add_argument("--dry-run", action="store_true",
                         help="No deja cambios permanentes ni commits en las copias")
+    parser.add_argument("--fresh", action="store_true",
+                        help="Ignora la reanudación (borra el log y reprocesa todo)")
     args = parser.parse_args()
 
     client = llm_client.LLMClient()
@@ -461,22 +823,45 @@ def main():
     print("Config:")
     print(f"  WORK_DIR={WORK_DIR} CC_THRESHOLD={CC_THRESHOLD} "
           f"CYCLO_PENALTY={CYCLO_PENALTY} MAX_CYCLO_DELTA_PCT={MAX_CYCLO_DELTA_PCT} "
-          f"SEED={SEED} RUN_TESTS={RUN_TESTS}")
+          f"SEED={SEED} REFACTOR_MAX_TOKENS={REFACTOR_MAX_TOKENS} RUN_TESTS={RUN_TESTS}")
+    print(f"  MODO={REFACTOR_MODE}"
+          + (f" BATCH_MAX_TOKENS={REFACTOR_BATCH_MAX_TOKENS}" if REFACTOR_MODE == "batch" else ""))
     print(f"  LLM: {client.base_url}  model={client.model}  "
           f"reasoning_effort={client.reasoning_effort}")
+
+    if args.fresh and LOG_PATH.exists():
+        LOG_PATH.unlink()
+        print("[fresh] log reiniciado")
 
     pairs = workspace.ensure_workspace(PROJECTS_DIR, WORK_DIR)
     work_map = {name: path for name, path in pairs}
 
+    # Limpiar restos de una ejecución interrumpida (archivos modificados sin commit)
+    for name, path in pairs:
+        st = subprocess.run(["git", "-C", str(path), "status", "--porcelain"],
+                            capture_output=True, text=True).stdout.strip()
+        if st:
+            print(f"[limpieza] {name}: se restauran {len(st.splitlines())} archivos "
+                  f"modificados (ejecución anterior interrumpida)")
+            subprocess.run(["git", "-C", str(path), "restore", "."], check=True)
+
     stats = {k: 0 for k in [
         "skipped_no_file", "skipped_no_technique", "skipped_not_found",
         "candidates", "no_valid_candidate", "kept_original", "kept_committed",
-        "kept_dry_run", "apply_failed", "methods_refactored",
+        "kept_dry_run", "apply_failed", "methods_refactored", "llm_errors",
     ]}
 
     csvs = sorted(DATA_DIR.glob("final_methods_dataset_*.csv"))
     if args.project:
         csvs = [c for c in csvs if c.name == f"final_methods_dataset_{args.project}.csv"]
+
+    done_keys = set() if args.fresh else load_done_keys()
+    if done_keys:
+        print(f"[resume] {len(done_keys)} métodos ya procesados; se reanudará desde ahí")
+
+    total = sum(len(pd.read_csv(c)) for c in csvs)
+    labeled_total = sum(int((pd.read_csv(c)[TARGETS].sum(axis=1) > 0).sum()) for c in csvs)
+    progress = Progress(total, labeled_total)
 
     total_processed = 0
     for csv_path in csvs:
@@ -495,13 +880,59 @@ def main():
 
         df = pd.read_csv(csv_path)
         print(f"\n=== {project} ({len(df)} métodos) ===")
+        pending = []
         for _, row in df.iterrows():
             if args.limit and total_processed >= args.limit:
                 break
-            process_method(project, work_path, row, client, args.dry_run, stats)
+            key = (project, str(row["file"]), int(row["method_start_line"]))
+            if key in done_keys:
+                progress.update("reanudado", labeled=False, resumed=True)
+                total_processed += 1
+                continue
+            pending.append((key, row))
             total_processed += 1
-            if total_processed % 10 == 0:
-                print(f"  ... {total_processed} métodos procesados")
+
+        if REFACTOR_MODE == "batch":
+            entries = []
+            for key, row in pending:
+                ent, err = batch_entry(project, work_path, row)
+                if ent is None:
+                    status = err
+                    if err == "no_technique":
+                        stats["skipped_no_technique"] += 1
+                    elif err == "no_file":
+                        stats["skipped_no_file"] += 1
+                    else:
+                        stats["skipped_not_found"] += 1
+                    log_entry(project=project, file=str(row["file"]),
+                              start_line=int(row["method_start_line"]),
+                              reason="método no localizado en el proyecto original"
+                              if err == "not_found" else None,
+                              status=status, valid=err != "no_technique")
+                    done_keys.add(key)
+                    progress.update(status,
+                                    labeled=status not in ("no_file", "no_technique", "not_found"))
+                    continue
+                entries.append(ent)
+                # Trocear por presupuesto de tokens (dejamos siempre al menos 1)
+                if len(entries) > 1 and _batch_tokens(entries) > REFACTOR_BATCH_MAX_TOKENS:
+                    chunk, entries = entries[:-1], [entries[-1]]
+                    for ent2, st in zip(chunk, process_batch(client, work_path, chunk,
+                                                             args.dry_run, stats)):
+                        key2 = (project, ent2["rel_file"], ent2["start_line"])
+                        done_keys.add(key2)
+                        progress.update(st, labeled=True)
+            if entries:
+                for ent2, st in zip(entries, process_batch(client, work_path, entries,
+                                                           args.dry_run, stats)):
+                    key2 = (project, ent2["rel_file"], ent2["start_line"])
+                    done_keys.add(key2)
+                    progress.update(st, labeled=True)
+        else:
+            for key, row in pending:
+                status = process_method(project, work_path, row, client, args.dry_run, stats)
+                done_keys.add(key)  # checkpoint en memoria ante cortes
+                progress.update(status, labeled=status not in ("no_file", "no_technique", "not_found"))
 
         if test_baseline is not None:
             after = run_tests_timed(work_path)
@@ -515,10 +946,13 @@ def main():
         if args.limit and total_processed >= args.limit:
             break
 
+    progress.finish()
     print("\n--- Resumen ---")
     for k, v in stats.items():
         print(f"  {k}: {v}")
     print(f"Log: {LOG_PATH}")
+    print("Para reanudar una ejecución interrumpida, vuelve a ejecutar el mismo comando "
+          "(los métodos ya procesados se saltan).")
 
 
 if __name__ == "__main__":

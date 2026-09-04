@@ -11,3 +11,4 @@ __pycache__/
 /notebooks/
 /data/*.csv
 /data/*.jsonl
+/data/opencode_session.id

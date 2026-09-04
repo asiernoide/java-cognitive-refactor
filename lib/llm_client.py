@@ -25,8 +25,11 @@ Probe (para comprobar la API key / proveedor):
 """
 
 import json
+import json
 import os
 import time
+import uuid
+from pathlib import Path
 
 import requests
 from dotenv import load_dotenv
@@ -39,6 +42,30 @@ DEFAULT_TEMPERATURE = 0.2
 DEFAULT_MAX_TOKENS = 2048
 DEFAULT_TIMEOUT = 120
 MAX_RETRIES = 2
+
+
+def _load_session_id() -> str:
+    """ID de sesión estable para el header x-opencode-session de OpenCode Go.
+    Se puede fijar con OPENCODE_SESSION_ID; si no, se genera un UUID persistente
+    (una única identidad por conversación/herramienta)."""
+    env = os.getenv("OPENCODE_SESSION_ID")
+    if env:
+        return env
+    f = Path(os.getenv("DATA_DIR", "data")) / "opencode_session.id"
+    try:
+        f.parent.mkdir(parents=True, exist_ok=True)
+        if f.exists():
+            sid = f.read_text(encoding="utf-8").strip()
+            if sid:
+                return sid
+        sid = str(uuid.uuid4())
+        f.write_text(sid, encoding="utf-8")
+        return sid
+    except OSError:
+        return str(uuid.uuid4())
+
+
+SESSION_ID = _load_session_id()
 
 _RETRY_STATUS = {429, 500, 502, 503, 504}
 
@@ -71,8 +98,10 @@ class LLMClient:
         )
 
     def chat(self, messages, json_mode=False, temperature=None, max_tokens=None,
-             reasoning_effort=None):
-        """Envía un chat y devuelve (contenido, usage). usage es dict o None."""
+             reasoning_effort=None, timeout=None, stream=False):
+        """Envía un chat y devuelve (contenido, usage). usage es dict o None.
+        Con stream=True lee la respuesta por SSE (necesario para generaciones
+        largas: el gateway corta las respuestas no-streaming que tardan mucho)."""
         url = f"{self.base_url}/chat/completions"
         payload = {
             "model": self.model,
@@ -85,40 +114,50 @@ class LLMClient:
             payload["reasoning_effort"] = effort
         if json_mode:
             payload["response_format"] = {"type": "json_object"}
+        if stream:
+            payload["stream"] = True
 
         headers = {
             "Content-Type": "application/json",
             "User-Agent": "opencode-tfm-refactor/0.1",
+            "x-opencode-session": SESSION_ID,  # requerido por OpenCode Go (estable)
         }
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
 
-        return self._post(url, headers, payload)
+        return self._post(url, headers, payload,
+                          timeout=timeout or self.timeout, stream=stream)
 
-    def chat_json(self, messages, temperature=None, max_tokens=None):
+    def chat_json(self, messages, temperature=None, max_tokens=None, timeout=None,
+                  stream=False):
         """Devuelve (dict_parseado, usage). Pide JSON; si el proveedor no
         soporta response_format, reintenta sin él y extrae el primer objeto JSON."""
         try:
             content, usage = self.chat(messages, json_mode=True,
-                                       temperature=temperature, max_tokens=max_tokens)
+                                       temperature=temperature, max_tokens=max_tokens,
+                                       timeout=timeout, stream=stream)
         except LLMError as e:
             if "response_format" not in str(e):
                 raise
             content, usage = self.chat(messages, json_mode=False,
-                                       temperature=temperature, max_tokens=max_tokens)
+                                       temperature=temperature, max_tokens=max_tokens,
+                                       timeout=timeout, stream=stream)
         return extract_json_object(content), usage
 
-    def _post(self, url, headers, payload):
+    def _post(self, url, headers, payload, timeout=None, stream=False):
         last_err = None
         for attempt in range(MAX_RETRIES + 1):
             try:
-                resp = requests.post(url, headers=headers, json=payload, timeout=self.timeout)
+                resp = requests.post(url, headers=headers, json=payload,
+                                     timeout=timeout or self.timeout)
             except requests.RequestException as e:
                 last_err = LLMError(f"Error de conexión: {e}")
                 time.sleep(2 ** attempt)
                 continue
 
             if resp.status_code == 200:
+                if stream:
+                    return self._consume_sse(resp)
                 data = resp.json()
                 content = data["choices"][0]["message"]["content"]
                 return content, data.get("usage")
@@ -132,6 +171,32 @@ class LLMClient:
             raise LLMError(f"HTTP {resp.status_code}: {body}")
 
         raise last_err if last_err else LLMError("Error desconocido al llamar al LLM")
+
+    @staticmethod
+    def _consume_sse(resp):
+        """Lee una respuesta en streaming (SSE) y acumula content + usage."""
+        content = ""
+        usage = None
+        try:
+            for raw in resp.iter_lines(decode_unicode=True):
+                if not raw or not raw.startswith("data:"):
+                    continue
+                data = raw[5:].strip()
+                if data == "[DONE]":
+                    break
+                try:
+                    chunk = json.loads(data)
+                except json.JSONDecodeError:
+                    continue
+                choices = chunk.get("choices") or []
+                if choices:
+                    delta = choices[0].get("delta") or {}
+                    content += delta.get("content") or ""
+                if chunk.get("usage"):
+                    usage = chunk["usage"]
+        finally:
+            resp.close()
+        return content, usage
 
 
 def extract_json_object(text):
