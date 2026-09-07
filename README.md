@@ -9,7 +9,7 @@ Sistema de detección, clasificación y refactorización automática de métodos
 El proyecto se divide en dos fases:
 
 1. **Detección y clasificación** *(implementada)*: el analizador AST (JavaParser) escanea los proyectos **localmente** (modo `scan`), detecta los métodos con `cognitive_complexity > 15` y extrae **19 métricas** por método, incluida la `cognitive_complexity` calculada localmente (ver [Complejidad cognitiva local](#complejidad-cognitiva-local)). Un clasificador determinista (`metrics_classifier.py`) aplica reglas sobre esas métricas para determinar qué técnica de refactorización corresponde. [Más sobre la evolución del enfoque de etiquetado →](docs/labeler-script.md#evolución-del-enfoque-de-etiquetado)
-2. **Refactorización automática** *(en desarrollo)*: un LLM aplica las técnicas recomendadas sobre **copias de trabajo** de los proyectos (ver `lib/workspace.py`). Para cada método con técnicas etiquetadas (1s en el dataset) se intenta **cada técnica por separado**: el LLM genera el código, se aplica en la copia, se miden las métricas (CC, ciclomática, invocations) y se **deshace el cambio con git**. De todas las versiones se conserva la de **menor complejidad cognitiva** (empate → menor ciclomática; empate → aleatorio con semilla fija), se aplica de forma permanente y se commitea en la copia. La detección/medición usa el analizador local; la localización de métodos se hace por **signatura** (`nombre + tipos de parámetros`), única dentro de una clase, porque tras un refactor las líneas cambian.
+2. **Refactorización automática** *(implementada)*: un LLM aplica las técnicas recomendadas sobre **copias de trabajo** de los proyectos (ver `lib/workspace.py`). Para cada método con técnicas etiquetadas (1s en el dataset) se generan candidatos por técnica: el LLM produce el código, se aplica en la copia, se miden las métricas (CC, ciclomática, invocations) y se **deshace el cambio con git**. De todas las versiones se conserva la de mayor **score penalizado** `S = ΔCC − λ·max(0, ΔCyclo)` (empate → menor ciclomática; empate → aleatorio con semilla fija); solo se aplica y commitea si `S > 0`. En **Extract Method** la CC/Ciclomática del candidato es el **total = método principal + suma de los extraídos** (para no reducir la CC artificialmente). La ejecución puede hacerse en **paralelo** (`run_parallel.py`, un worker por grupo de proyectos, con reanudación). La localización de métodos se hace por **signatura** (`nombre + tipos de parámetros`), única dentro de una clase, porque tras un refactor las líneas cambian.
 
 ![Pipeline del TFM](docs/images/pipeline.png)
 
@@ -43,7 +43,8 @@ La métrica `cognitive_complexity` se calcula **localmente** con JavaParser, rep
 ```
 java-cognitive-refactor/
 ├── main.py                       # Pipeline principal (detección local → CSV)
-├── refactor_loop.py              # Bucle de refactorización con LLM (C3)
+├── refactor_loop.py              # Bucle de refactorización con LLM
+├── run_parallel.py               # Lanzador paralelo (N workers, reanudación)
 ├── metrics_classifier.py         # Clasificador basado en reglas sobre métricas
 │
 ├── lib/
@@ -66,12 +67,15 @@ java-cognitive-refactor/
 ├── data/
 │   ├── aggregate_method_data.py  # Script de consolidación de CSVs
 │   ├── aggregated_method_data.csv
-│   └── final_methods_dataset_*.csv
+│   ├── final_methods_dataset_*.csv
+│   ├── refactor_log*.jsonl       # Logs de las ejecuciones (no versionados)
+│   └── run_parallel.cmd          # Lanzador de ejecución paralela (ventana)
 │
 ├── docs/
 │   ├── ast-metrics.md            # Documentación de métricas extraídas
 │   └── labeler-script.md         # Documentación del script de etiquetado
 │
+├── Graficas/                     # Gráficas de resultados (CC/cyclo por técnica y λ)
 ├── projects/                     # Código fuente de proyectos analizados
 ├── requirements.txt
 ├── .env                          # Variables de entorno (no versionado)
@@ -103,10 +107,13 @@ CC_THRESHOLD=15
 WORK_DIR=out
 REFACTOR_CYCLO_PENALTY=1
 REFACTOR_MAX_CYCLO_DELTA_PCT=0
+REFACTOR_SEED=42
 REFACTOR_MAX_TOKENS=24000
 REFACTOR_MODE=stream
-REFACTOR_BATCH_MAX_TOKENS=30000
-REFACTOR_BATCH_TIMEOUT=1800
+REFACTOR_BATCH_MAX_TOKENS=100000
+REFACTOR_BATCH_TIMEOUT=600
+REFACTOR_BATCH_RETRIES=2
+REFACTOR_RUN_TESTS=never
 LLM_BASE_URL=https://opencode.ai/zen/go/v1
 LLM_API_KEY=your_api_key_here
 LLM_MODEL=deepseek-v4-flash
@@ -128,7 +135,7 @@ $$S(c) = \Delta CC(c) - \lambda \cdot \max\big(0,\ \Delta Cyclo(c)\big)$$
 
 En **Extract Method**, la CC/Ciclomática del candidato se mide como **total = método principal + suma de los métodos extraídos** (si solo se midiera el principal, extraer lógica a sub-métodos reduciría la CC artificialmente). Así, la extracción solo se acepta si el total mejora al original.
 
-`REFACTOR_MODE` elige cómo se hacen las llamadas LLM: `stream` (default) hace **una llamada por técnica y método**; `batch` agrupa varios métodos en **una sola llamada** (JSON: entrada `{"methods":[{id, signature, techniques, source}]}` → salida `{"refactors":[{id, technique, main_method, new_methods}]}`) y luego evalúa cada candidato con los mismos criterios (`select_best`, log). El modo batch elimina el overhead fijo por petición y la duplicación de llamadas por técnica: para la API de OpenCode Go es lo recomendable (la generación en stream es ~70-80 tok/s y es el límite real). `REFACTOR_BATCH_MAX_TOKENS` es el presupuesto de tokens por llamada (default `30000`, ~3-5 métodos; valores de ~60k generan respuestas de muchos minutos que el gateway corta de forma intermitente) y `REFACTOR_BATCH_TIMEOUT` el timeout de esa llamada (default `1800`s). Las llamadas del batch usan **streaming** (el gateway cierra las respuestas no-streaming que tardan demasiado).
+`REFACTOR_MODE` elige cómo se hacen las llamadas LLM: `stream` (default) hace **una llamada por técnica y método**; `batch` agrupa varios métodos en **una sola llamada** (JSON: entrada `{"methods":[{id, signature, techniques, source}]}` → salida `{"refactors":[{id, technique, main_method, new_methods}]}`) y luego evalúa cada candidato con los mismos criterios (`select_best`, log). En batch, los métodos que fallan (no parsean, JSON inválido, ausentes) se **reintentan en rondas dirigidas** (`REFACTOR_BATCH_RETRIES`, default 2) reenviando solo esos métodos con el **error exacto** (Parse/Lexical) como feedback al LLM para que lo corrijan; si un lote entero falla, se parte por la mitad y se reintenta. `REFACTOR_BATCH_MAX_TOKENS` es el presupuesto de **salida** por llamada (default `100000`; DeepSeek V4 Flash permite hasta ~384k, así que cada llamada puede llevar decenas de métodos) y `REFACTOR_BATCH_TIMEOUT` es la guardia de reloj mínima (default `600`s), adaptativa al tamaño del lote. Las llamadas del batch usan **streaming** (el gateway cierra las respuestas no-streaming que tardan demasiado) con guardia de reloj para no quedarse colgado en streams silenciosos.
 
 ---
 
@@ -177,9 +184,10 @@ Crea copias de trabajo de los proyectos (`WORK_DIR`, default `out/`) y, para cad
 python run_parallel.py -n 4              # ejecución completa con 4 workers
 python run_parallel.py -n 4 --fresh      # ignora reanudación
 python run_parallel.py -n 3 --dry-run --limit 4   # prueba rápida
+python run_parallel.py -n 2 --resume data/resume.jsonl   # reanuda desde otro log
 ```
 
-Reparte los proyectos entre N workers (cada proyecto lo procesa un solo worker, cada worker con su propio workspace y su propio log, y un `OPENCODE_SESSION_ID` distinto). Al terminar fusiona los logs parciales en `data/refactor_log.jsonl`; la reanudación se lee de ese log principal. El arranque de cada worker solo clona/restaura **sus** proyectos, para no pisar a los demás.
+Reparte los proyectos entre N workers (cada proyecto lo procesa un solo worker, cada worker con su propio workspace y su propio log, y un `OPENCODE_SESSION_ID` distinto). Al terminar fusiona los logs parciales en `data/refactor_log.jsonl`; la reanudación se lee de ese log principal (o del indicado con `--resume`). El arranque de cada worker solo clona/restaura **sus** proyectos, para no pisar a los demás.
 
 ### 5. Escanear un proyecto (detección local) y analizar por signatura
 
@@ -216,6 +224,20 @@ El proyecto etiqueta cada método con hasta 2 de las siguientes 5 técnicas:
 Cada columna contiene `1` si la técnica es aplicable o `0` si no lo es.
 
 La documentación detallada de las reglas de clasificación y el funcionamiento de `metrics_classifier.py` está en [docs/labeler-script.md](docs/labeler-script.md).
+
+---
+
+## Resultados
+
+Tres ejecuciones completas sobre el dataset (988 métodos) variando el parámetro de penalización de ciclomática `λ` del score `S = ΔCC − λ·max(0, ΔCyclo)`:
+
+| λ | Reducción CC global | Reducción Cyclo global | Métodos refactorizados | keep_original |
+|---|---|---|---|---|
+| 0 | **−21.6%** | −4.7% | 415 | 196 |
+| 0.5 | −21.2% | −7.7% | 341 | 270 |
+| 1 | −21.5% | **−8.8%** | 333 | 278 |
+
+Al subir `λ` la ciclomática mejora progresivamente (−4.7% → −7.7% → −8.8%) manteniendo la reducción de complejidad cognitiva alrededor del −21%. La CC de cada candidato (y la ciclomática en Extract Method) se mide como **total efectivo** (método principal + métodos extraídos), por lo que la reducción no es artificial. Las gráficas por técnica y λ están en `Graficas/`. Los logs de cada ejecución (`data/refactor_log_lambda_{0,05,1}.jsonl`) registran por método: técnica, CC/ciclomática base y candidata, score, tokens y decisión.
 
 ---
 

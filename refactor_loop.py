@@ -1,15 +1,22 @@
 """
-Bucle de refactorización con LLM (C3).
+Bucle de refactorización con LLM.
 
-Para cada método del dataset con técnicas etiquetadas (1s), se intenta CADA
-técnica por separado (enfoque propuesto por el cotutor):
-  1. Extraer el método original de la copia de trabajo (out/).
-  2. Pedir al LLM el código refactorizado con esa técnica.
-  3. Aplicar el cambio en la copia, medir métricas y DESHACER el cambio (git).
-  4. Quedarse con la mejor versión según el score penalizado
-     S = ΔCC − λ·max(0, ΔCyclo) (ver más abajo); aplicar solo si S > 0.
-La mejor versión se aplica de forma permanente y se commitea en la copia
-(si su score es positivo). La copia original de projects/ queda intacta.
+Para cada método del dataset con técnicas etiquetadas (1s), se generan
+candidatos refactorizados y se elige el mejor según el score penalizado
+S = ΔCC − λ·max(0, ΔCyclo); solo se aplica y commitea si S > 0. La copia
+original de projects/ queda intacta; el trabajo se hace en copias (out/).
+
+Dos modos de llamada al LLM (REFACTOR_MODE):
+  - stream: una llamada por técnica y método.
+  - batch: agrupa varios métodos en UNA llamada (JSON). Los métodos que fallan
+    (no parsean, JSON inválido, etc.) se REINTENTAN en rondas dirigidas
+    (REFACTOR_BATCH_RETRIES) enviando el error exacto como feedback al LLM;
+    si el lote entero falla, se parte por la mitad. Usa streaming + guardia de
+    reloj adaptativa (el gateway corta las respuestas no-streaming largas).
+
+En Extract Method, la CC/Ciclomática del candidato es el TOTAL
+(método principal + suma de los métodos extraídos) para no reducir la CC
+artificialmente escondiendo lógica en sub-métodos.
 
 Config (.env):
     WORK_DIR                     copias de trabajo (default out)
@@ -19,9 +26,15 @@ Config (.env):
     REFACTOR_MAX_CYCLO_DELTA_PCT red de seguridad opcional: % de aumento de
                                  ciclomática permitido (0 = sin límite)
     REFACTOR_SEED                semilla para el empate aleatorio (default 42)
-    REFACTOR_MAX_TOKENS          máx. tokens de salida por llamada al LLM en el
-                                 refactor (default 24000; los métodos grandes
-                                 necesitan más que LLM_MAX_TOKENS)
+    REFACTOR_MAX_TOKENS          máx. tokens de salida por llamada en stream
+                                 (default 24000)
+    REFACTOR_MODE                stream | batch (default stream)
+    REFACTOR_BATCH_MAX_TOKENS    presupuesto de SALIDA por llamada batch
+                                 (default 100000; DeepSeek permite ~384k)
+    REFACTOR_BATCH_TIMEOUT       guardia de reloj mínima por llamada batch,
+                                 adaptativa al tamaño del lote (default 600s)
+    REFACTOR_BATCH_RETRIES       rondas de reintento dirigido de fallidos
+                                 (default 2)
     REFACTOR_RUN_TESTS           never/auto/always: cronometrar la suite de
                                  tests del proyecto antes/después del pase
     LLM_*                        cliente OpenAI-compatible (lib/llm_client.py)
@@ -35,6 +48,8 @@ original). Las fórmulas están documentadas en la nota Semana 10 (Obsidian).
 
 Uso:
     python refactor_loop.py [--project X] [--limit N] [--dry-run]
+                           [--fresh] [--log FICHERO] [--resume FICHERO] [--quiet]
+    python run_parallel.py -n 4 [--fresh] [--resume FICHERO]   # paralelo
 """
 
 import argparse
