@@ -165,7 +165,21 @@ Aplica reglas deterministas sobre las métricas del CSV para predecir refactoriz
 python refactor_loop.py [--project <proyecto>] [--limit N] [--dry-run]
 ```
 
-Crea copias de trabajo de los proyectos (`WORK_DIR`, default `out/`) y, para cada método del dataset con técnicas etiquetadas, intenta cada técnica con el LLM: aplica → mide (CC, ciclomática, invocations) → **deshace con git**. La mejor versión se elige por el **score penalizado** `S = ΔCC − λ·max(0, ΔCyclo)` (ver [Configuración](#configuración)): solo se aplica y commitea si `S > 0`, si no se mantiene el original. `--dry-run` no deja cambios ni commits. El detalle de cada intento (con su score) se registra en `data/refactor_log.jsonl`. Config: `WORK_DIR`, `CC_THRESHOLD`, `REFACTOR_CYCLO_PENALTY`, `REFACTOR_MAX_CYCLO_DELTA_PCT` (0 = sin límite), `REFACTOR_SEED`, `REFACTOR_RUN_TESTS` (`never`/`auto`/`always`, cronometra la suite de tests del proyecto antes/después del pase).
+Crea copias de trabajo de los proyectos (`WORK_DIR`, default `out/`) y, para cada método del dataset con técnicas etiquetadas, intenta cada técnica con el LLM: aplica → mide (CC, ciclomática, invocations) → **deshace con git**. La mejor versión se elige por el **score penalizado** `S = ΔCC − λ·max(0, ΔCyclo)` (ver [Configuración](#configuración)): solo se aplica y commitea si `S > 0`, si no se mantiene el original. `--dry-run` no deja cambios ni commits. El detalle de cada intento (con su score) se registra en `data/refactor_log.jsonl`. Config: `WORK_DIR`, `CC_THRESHOLD`, `REFACTOR_CYCLO_PENALTY`, `REFACTOR_MAX_CYCLO_DELTA_PCT` (0 = sin límite), `REFACTOR_SEED`, `REFACTOR_RUN_TESTS` (`never`/`auto`/`always`, cronometra la suite de tests del proyecto antes/después del pase). Ver [Modo batch](#modo-batch) y [Ejecución paralela](#ejecución-paralela).
+
+#### Modo batch
+
+`REFACTOR_MODE=batch` agrupa varios métodos en **una sola llamada LLM** (JSON) y luego evalúa cada candidato con los mismos criterios que en stream (ver [Configuración](#configuración)). `REFACTOR_BATCH_MAX_TOKENS` controla el tamaño del lote y `REFACTOR_BATCH_TIMEOUT` su timeout; las llamadas del batch usan streaming.
+
+#### Ejecución paralela
+
+```bash
+python run_parallel.py -n 4              # ejecución completa con 4 workers
+python run_parallel.py -n 4 --fresh      # ignora reanudación
+python run_parallel.py -n 3 --dry-run --limit 4   # prueba rápida
+```
+
+Reparte los proyectos entre N workers (cada proyecto lo procesa un solo worker, cada worker con su propio workspace y su propio log, y un `OPENCODE_SESSION_ID` distinto). Al terminar fusiona los logs parciales en `data/refactor_log.jsonl`; la reanudación se lee de ese log principal. El arranque de cada worker solo clona/restaura **sus** proyectos, para no pisar a los demás.
 
 ### 5. Escanear un proyecto (detección local) y analizar por signatura
 

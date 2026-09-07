@@ -50,12 +50,16 @@ def _git_init_and_initial_commit(repo: Path) -> None:
     )
 
 
-def ensure_workspace(projects_dir: str, work_dir: str | None = None) -> list[tuple[str, Path]]:
+def ensure_workspace(projects_dir: str, work_dir: str | None = None,
+                     only: list[str] | set[str] | None = None) -> list[tuple[str, Path]]:
     """
     Garantiza una copia de trabajo (clon local) de cada proyecto en work_dir.
     Idempotente: si la copia ya existe y tiene .git con contenido, la reutiliza.
     Si el proyecto original no tiene historial git, se copia literalmente y se
     inicializa git con un commit inicial (restore por git igualmente posible).
+    `only` (opcional): lista de nombres de proyecto; si se da, solo se asegura
+    el workspace de esos proyectos (evita que workers paralelos clonen los
+    mismos directorios a la vez).
     Devuelve [(nombre_proyecto, ruta_copia), ...].
     """
     projects_dir = Path(projects_dir)
@@ -65,8 +69,11 @@ def ensure_workspace(projects_dir: str, work_dir: str | None = None) -> list[tup
     if not projects_dir.is_dir():
         raise FileNotFoundError(f"No existe el directorio de proyectos: {projects_dir}")
 
+    only_set = set(only) if only else None
     result = []
     for proj in sorted(p for p in projects_dir.iterdir() if p.is_dir()):
+        if only_set is not None and proj.name not in only_set:
+            continue
         dst = work_dir / proj.name
 
         # Reutilizar si la copia ya es válida (con git y contenido)

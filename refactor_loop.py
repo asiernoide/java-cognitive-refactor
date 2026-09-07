@@ -67,12 +67,17 @@ RUN_TESTS = os.getenv("REFACTOR_RUN_TESTS", "never")
 # Modo de trabajo: "stream" = una llamada LLM por método (por defecto);
 # "batch" = agrupa varios métodos en UNA llamada (más barato en latencia).
 REFACTOR_MODE = os.getenv("REFACTOR_MODE", "stream")
-# Presupuesto de tokens por llamada en modo batch (input+output objetivo).
-# Valores grandes (~60k) generan respuestas de muchos minutos que el gateway
-# corta de forma intermitente; 20k-30k (~3-5 métodos por llamada) es lo fiable.
-REFACTOR_BATCH_MAX_TOKENS = int(os.getenv("REFACTOR_BATCH_MAX_TOKENS", "30000"))
-# Timeout por llamada en modo batch (la generación de un lote tarda minutos).
-REFACTOR_BATCH_TIMEOUT = int(os.getenv("REFACTOR_BATCH_TIMEOUT", "1800"))
+# Presupuesto de tokens de SALIDA por llamada en modo batch. DeepSeek V4 Flash
+# permite hasta ~384k de salida; con lotes grandes el coste por llamada es una
+# sola vez y los fallos se recuperan con reintentos dirigidos (ver abajo).
+REFACTOR_BATCH_MAX_TOKENS = int(os.getenv("REFACTOR_BATCH_MAX_TOKENS", "100000"))
+# Timeout (guardia de reloj) por llamada en modo batch. Se ajusta en proceso
+# según el tamaño del lote (véase process_batch): guardia = max(este valor,
+# tiempo estimado de generación × 2).
+REFACTOR_BATCH_TIMEOUT = int(os.getenv("REFACTOR_BATCH_TIMEOUT", "600"))
+# Reintentos dirigidos: rondas extra que reenvían SOLO los métodos fallidos del
+# lote, indicando al LLM el error exacto para que lo corrija.
+REFACTOR_BATCH_RETRIES = int(os.getenv("REFACTOR_BATCH_RETRIES", "2"))
 
 TARGETS = [
     "refactor_extract_method",
@@ -135,6 +140,22 @@ SYSTEM_PROMPT_BATCH = (
     "Method). Preserve the behavior of every method exactly. No text outside the JSON."
 )
 
+SYSTEM_PROMPT_BATCH_RETRY = (
+    "You are an expert Java refactoring assistant specialized in reducing cognitive "
+    "complexity. You receive a JSON object with an array of Java methods that FAILED in "
+    "a previous refactoring attempt. Each method includes an \"error\" field with the "
+    "exact error (typically a Java parser/compile error) that the previous attempt "
+    "produced. Respond ONLY with a JSON object with a single field \"refactors\": an "
+    "array of entries, one per input method id (every method must be retried). Each "
+    "entry must be a JSON object with exactly: \"id\" (the input method id, an integer), "
+    "\"technique\" (one of the allowed techniques for that method), \"main_method\" (the "
+    "refactored original method as a single Java method declaration with the exact same "
+    "signature as the input), and \"new_methods\" (an array of new private Java method "
+    "declarations; an empty array when the technique is not Extract Method). FIX the "
+    "error shown in each method's \"error\" field: the result MUST be syntactically "
+    "valid Java that parses. Preserve behavior exactly. No text outside the JSON."
+)
+
 RNG = random.Random(SEED)
 LOG_PATH = DATA_DIR / "refactor_log.jsonl"
 
@@ -153,10 +174,12 @@ class Progress:
     control (checkpoint) cada N métodos para poder seguir el avance desde el
     fichero de salida cuando se ejecuta en segundo plano."""
 
-    def __init__(self, total: int, labeled_total: int, checkpoint_every: int = 25):
+    def __init__(self, total: int, labeled_total: int, checkpoint_every: int = 25,
+                 quiet: bool = False):
         self.total = total
         self.labeled_total = labeled_total
         self.checkpoint_every = checkpoint_every
+        self.quiet = quiet
         self.processed = 0
         self.labeled_done = 0
         self.resume_skipped = 0
@@ -167,10 +190,13 @@ class Progress:
     def update(self, status: str, labeled: bool = False, resumed: bool = False):
         self.processed += 1
         if resumed:
+            # Los reanudados se muestran una sola vez (via resume_skipped),
+            # no duplicados en counts con la clave "reanudado".
             self.resume_skipped += 1
-        elif labeled:
-            self.labeled_done += 1
-        self.counts[status] = self.counts.get(status, 0) + 1
+        else:
+            self.counts[status] = self.counts.get(status, 0) + 1
+            if labeled:
+                self.labeled_done += 1
         self._render_live()
         if self.processed % self.checkpoint_every == 0:
             self._render_checkpoint()
@@ -186,12 +212,25 @@ class Progress:
         return self.processed / elapsed if elapsed > 0 else 0.0, elapsed
 
     def _eta(self):
-        rate, _ = self._rate()
-        if rate <= 0:
+        """ETA basado SOLO en el ritmo de los métodos etiquetados (los que hacen
+        trabajo LLM). El ritmo global mezcla los métodos instantáneos
+        (no_technique, not_found, reanudados) y deja el ETA demasiado optimista
+        (p. ej. '12 min' cuando faltan ~1h). Los métodos rápidos restantes se
+        estiman a ~60/s."""
+        elapsed = time.time() - self.t0
+        if self.labeled_done <= 0 or elapsed <= 0:
             return "?"
-        return fmt_eta((self.total - self.processed) / rate)
+        labeled_rate = self.labeled_done / elapsed
+        remaining_labeled = max(0, self.labeled_total - self.labeled_done)
+        remaining_total = max(0, self.total - self.processed)
+        remaining_fast = max(0, remaining_total - remaining_labeled)
+        eta_labeled = remaining_labeled / labeled_rate if labeled_rate > 0 else 0.0
+        eta_fast = remaining_fast / 60.0 if remaining_fast > 0 else 0.0
+        return fmt_eta(eta_labeled + eta_fast)
 
     def _render_live(self):
+        if self.quiet:
+            return
         now = time.time()
         if now - self._last < 2:
             return
@@ -212,20 +251,23 @@ class Progress:
         print(self._counts_str(), flush=True)
 
 
-def load_done_keys() -> set[tuple[str, str, int]]:
+def load_done_keys(resume_path: Path | None = None) -> set[tuple[str, str, int]]:
     """Conjunto de métodos ya procesados (project, file, start_line) a partir de
     las entradas del log con campo `status` (marcan el final del procesamiento
-    de un método). Permite reanudar sin repetir trabajo ni gastar tokens."""
+    de un método). Permite reanudar sin repetir trabajo ni gastar tokens.
+    `resume_path` permite leer un log distinto del de salida (paralelismo)."""
+    path = resume_path or LOG_PATH
     keys = set()
-    if not LOG_PATH.exists():
+    if not path.exists():
         return keys
-    with open(LOG_PATH, encoding="utf-8") as f:
+    with open(path, encoding="utf-8") as f:
         for line in f:
             try:
                 e = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            if e.get("status") and e.get("start_line") is not None:
+            if e.get("status") and e.get("status") != "llm_error" \
+                    and e.get("start_line") is not None:
                 keys.add((e["project"], e["file"], int(e["start_line"])))
     return keys
 
@@ -726,78 +768,176 @@ def batch_entry(project: str, work_path: Path, row) -> tuple[dict | None, str | 
 
 
 def _batch_tokens(entries: list[dict]) -> int:
-    """Estimación aproximada de tokens de entrada del batch (chars//3 + 200)."""
-    return sum(len(e["source"]) // 3 + 200 for e in entries)
+    """Estimación de los tokens de SALIDA del batch (lo que debe caber en
+    max_tokens): por cada método y técnica, una refactorización de tamaño ~ el
+    del método. Se usa el 80% del tope como margen: si un batch se pasa del
+    max_tokens el JSON llega truncado ('JSON sin cerrar') y se pierde el lote."""
+    return int(sum(len(e["source"]) // 3 * max(1, len(e["techniques"])) + 200
+                   for e in entries))
 
 
-def process_batch(client, work_path: Path, entries: list[dict], dry_run: bool,
-                  stats: dict) -> list[str]:
-    """Procesa un lote de métodos con UNA sola llamada LLM (JSON):
-        in  -> {"methods": [{id, signature, techniques, source}, ...]}
-        out -> {"refactors": [{id, technique, main_method, new_methods}, ...]}
-    Después evalúa cada candidato localmente con nuestros criterios (mismo
-    select_best / log que el modo stream) y aplica los aceptados."""
+def _batch_call(client, entries: list[dict], stats: dict,
+                errors: dict | None = None) -> tuple[dict | None, dict | None]:
+    """Una llamada batch (streaming + guardia de reloj adaptativa). Devuelve
+    (data, usage) o (None, None) si fallan los 3 intentos. Con `errors`
+    (dict id -> mensaje de error) reenvía solo los métodos fallidos indicando al
+    LLM el error exacto para que lo corrija (prompt de reintento)."""
     project = entries[0]["project"]
-    methods_payload = [
-        {"id": i, "signature": e["signature"], "techniques": e["techniques"],
-         "source": e["source"]}
-        for i, e in enumerate(entries)
-    ]
-    user = json.dumps({"methods": methods_payload}, ensure_ascii=False)
-
-    data, usage = None, None
+    methods = []
+    for i, e in enumerate(entries):
+        m = {"id": i, "signature": e["signature"], "techniques": e["techniques"],
+             "source": e["source"]}
+        if errors:
+            m["error"] = errors.get(i, "")
+        methods.append(m)
+    user = json.dumps({"methods": methods}, ensure_ascii=False)
+    system = SYSTEM_PROMPT_BATCH_RETRY if errors else SYSTEM_PROMPT_BATCH
+    # Guardia de reloj adaptativa: la generación va a ~75 tok/s; doble margen.
+    est = _batch_tokens(entries)
+    guard = max(REFACTOR_BATCH_TIMEOUT, int(est / 75) * 2 + 120)
     for attempt in range(3):
         try:
             data, usage = client.chat_json([
-                {"role": "system", "content": SYSTEM_PROMPT_BATCH},
+                {"role": "system", "content": system},
                 {"role": "user", "content": user},
-            ], max_tokens=REFACTOR_BATCH_MAX_TOKENS, timeout=REFACTOR_BATCH_TIMEOUT,
-               stream=True)
-            break
+            ], max_tokens=REFACTOR_BATCH_MAX_TOKENS, timeout=guard, stream=True)
+            return data, usage
         except llm_client.LLMError as e:
             stats["llm_errors"] += 1
             log_entry(event="batch", project=project, methods=len(entries),
                       reason=f"LLM error: {e}")
             time.sleep(3 ** attempt)
+    return None, None
+
+
+def _group_refactors(data: dict | None) -> dict[int, list[dict]]:
+    by: dict[int, list[dict]] = {}
+    for r in (data or {}).get("refactors") or []:
+        if isinstance(r, dict) and isinstance(r.get("id"), int):
+            by.setdefault(r["id"], []).append(r)
+    return by
+
+
+def _evaluate_batch_method(work_path: Path, entry: dict, refactors: list[dict],
+                           batch_tokens: int, stats: dict) -> tuple[list[dict], str]:
+    """Evalúa los refactors devueltos para un método (aplicar→medir→revertir).
+    Devuelve (candidatos, error_concat) donde error_concat está vacío si hay
+    candidatos o contiene el/los motivos del fallo (para el feedback dirigido)."""
+    candidates = []
+    errors = []
+    for r in refactors:
+        technique = r.get("technique")
+        main_code = r.get("main_method") or ""
+        new_methods = r.get("new_methods") or []
+        if technique not in entry["techniques"]:
+            errors.append(f"técnica '{technique}' no permitida")
+            continue
+        if not main_code.strip() or len(main_code.strip()) < 20 \
+                or "(" not in main_code or "{" not in main_code:
+            errors.append("salida vacía o demasiado corta")
+            continue
+        cand = evaluate_candidate(work_path, entry["rel_file"], entry["base"],
+                                  entry["locate_sig"], technique, main_code,
+                                  new_methods, entry["project"], tokens=batch_tokens)
+        if cand is not None:
+            candidates.append(cand)
+        else:
+            errors.append(ast.last_error or "no parsea o cambia la firma")
+        stats["candidates"] += 1
+    if not refactors:
+        errors.append("el LLM no devolvió ningún refactor para este método")
+    return candidates, " | ".join(dict.fromkeys(errors))
+
+
+def _retry_batch(client, work_path: Path, failed: list[tuple[dict, str]],
+                 batch_tokens: int, stats: dict, retries_left: int):
+    """Rondas de reintento dirigido sobre la lista (entry, error). Devuelve
+    (results_fixed, still_failed). Cada ronda reenvía SOLO los métodos fallidos
+    con el error exacto como feedback."""
+    results = []
+    while failed and retries_left > 0:
+        retries_left -= 1
+        stats["batch_retries"] += 1
+        entries = [e for e, _ in failed]
+        errors = {i: err for i, (_, err) in enumerate(failed)}
+        data, _usage = _batch_call(client, entries, stats, errors=errors)
+        if data is None:
+            # El reintento también falló del todo: partir y reintentar cada mitad
+            if len(entries) > 1:
+                mid = len(entries) // 2
+                r1, f1 = _retry_batch(client, work_path, failed[:mid], batch_tokens,
+                                      stats, retries_left)
+                r2, f2 = _retry_batch(client, work_path, failed[mid:], batch_tokens,
+                                      stats, retries_left)
+                return results + r1 + r2, f1 + f2
+            break
+        by_id = _group_refactors(data)
+        new_failed = []
+        for i, (e, _old) in enumerate(failed):
+            cands, err = _evaluate_batch_method(work_path, e, by_id.get(i, []),
+                                                batch_tokens, stats)
+            if cands:
+                results.append((e, cands))
+            else:
+                new_failed.append((e, err or "el LLM no devolvió ningún refactor válido"))
+        failed = new_failed
+    return results, failed
+
+
+def process_batch(client, work_path: Path, entries: list[dict], dry_run: bool,
+                  stats: dict) -> list[str]:
+    """Procesa un lote de métodos: UNA llamada grande con todos (aprovechando el
+    output amplio de DeepSeek) y reintentos dirigidos de los que fallan, pasando
+    al LLM el error exacto. Después cada método con candidatos se decide y aplica
+    con los criterios habituales (select_best, log). Devuelve el estado por método."""
+    data, usage = _batch_call(client, entries, stats)
     if data is None:
+        # Fallo total del lote: partir por la mitad y reintentar cada parte.
+        if len(entries) > 1:
+            mid = len(entries) // 2
+            return (process_batch(client, work_path, entries[:mid], dry_run, stats)
+                    + process_batch(client, work_path, entries[mid:], dry_run, stats))
         for e in entries:
-            stats["no_valid_candidate"] += 1
+            stats["llm_errors"] += 1
             log_entry(project=e["project"], file=e["rel_file"], start_line=e["start_line"],
                       signature=e["signature"], base_cc=e["base_cc"],
-                      reason="error de LLM en el batch", status="no_valid_candidate")
-        return ["no_valid_candidate"] * len(entries)
+                      reason="el batch no respondió JSON válido (incl. en solitario)",
+                      status="llm_error", valid=False)
+        return ["llm_error"]
 
+    project = entries[0]["project"]
     batch_tokens = (usage or {}).get("total_tokens", 0)
     log_entry(event="llm_batch", project=project, methods=len(entries),
               tokens=batch_tokens)
 
-    by_id: dict[int, list[dict]] = {}
-    for r in (data or {}).get("refactors") or []:
-        if isinstance(r, dict) and isinstance(r.get("id"), int):
-            by_id.setdefault(r["id"], []).append(r)
-
-    statuses = []
+    # Evaluación inicial: separar métodos OK de fallidos (con su error)
+    results = []    # (entry, candidates)
+    failed = []     # (entry, error)
+    by_id = _group_refactors(data)
     for i, e in enumerate(entries):
-        candidates = []
-        for r in by_id.get(i, []):
-            technique = r.get("technique")
-            main_code = r.get("main_method") or ""
-            new_methods = r.get("new_methods") or []
-            if technique not in e["techniques"]:
-                continue
-            if not main_code.strip() or len(main_code.strip()) < 20 \
-                    or "(" not in main_code or "{" not in main_code:
-                log_entry(project=e["project"], file=e["rel_file"],
-                          start_line=e["start_line"], signature=e["signature"],
-                          technique=technique,
-                          reason="salida del LLM vacía o demasiado corta", valid=False)
-                continue
-            cand = evaluate_candidate(work_path, e["rel_file"], e["base"], e["locate_sig"],
-                                      technique, main_code, new_methods, e["project"],
-                                      tokens=batch_tokens)
-            if cand is not None:
-                candidates.append(cand)
-            stats["candidates"] += 1
+        cands, err = _evaluate_batch_method(work_path, e, by_id.get(i, []),
+                                            batch_tokens, stats)
+        if cands:
+            results.append((e, cands))
+        else:
+            failed.append((e, err))
+
+    # Reintentos dirigidos con feedback del error exacto
+    fixed, still_failed = _retry_batch(client, work_path, failed, batch_tokens,
+                                       stats, REFACTOR_BATCH_RETRIES)
+    results.extend(fixed)
+
+    # Métodos que siguen fallando: llm_error (NO final; se reintentarán al reanudar)
+    for e, err in still_failed:
+        stats["llm_errors"] += 1
+        log_entry(project=e["project"], file=e["rel_file"], start_line=e["start_line"],
+                  signature=e["signature"], base_cc=e["base_cc"],
+                  reason=f"falló tras reintentos: {err[:200]}",
+                  status="llm_error", valid=False)
+
+    # Decidir y aplicar cada método con candidatos (mismo criterio que stream)
+    statuses = []
+    for e, candidates in results:
         statuses.append(finalize_method(e["project"], work_path, e["rel_file"],
                                         e["start_line"], e["signature"], e["locate_sig"],
                                         e["base_cc"], e["base_cyclo"], candidates,
@@ -813,7 +953,17 @@ def main():
                         help="No deja cambios permanentes ni commits en las copias")
     parser.add_argument("--fresh", action="store_true",
                         help="Ignora la reanudación (borra el log y reprocesa todo)")
+    parser.add_argument("--log", help="Fichero de log de salida (default data/refactor_log.jsonl)")
+    parser.add_argument("--resume", help="Fichero del que leer los métodos ya hechos para "
+                        "reanudar (default: el mismo que --log)")
+    parser.add_argument("--quiet", action="store_true",
+                        help="Sin línea de progreso en vivo (usar en ejecuciones paralelas)")
     args = parser.parse_args()
+
+    if args.log:
+        global LOG_PATH
+        LOG_PATH = Path(args.log)
+    resume_path = Path(args.resume) if args.resume else LOG_PATH
 
     client = llm_client.LLMClient()
     if not client.api_key:
@@ -828,16 +978,23 @@ def main():
           + (f" BATCH_MAX_TOKENS={REFACTOR_BATCH_MAX_TOKENS}" if REFACTOR_MODE == "batch" else ""))
     print(f"  LLM: {client.base_url}  model={client.model}  "
           f"reasoning_effort={client.reasoning_effort}")
+    print(f"  LOG={LOG_PATH}")
 
     if args.fresh and LOG_PATH.exists():
         LOG_PATH.unlink()
         print("[fresh] log reiniciado")
 
-    pairs = workspace.ensure_workspace(PROJECTS_DIR, WORK_DIR)
+    own_projects = set(args.project.split(",")) if args.project else None
+    pairs = workspace.ensure_workspace(PROJECTS_DIR, WORK_DIR, only=own_projects)
     work_map = {name: path for name, path in pairs}
 
-    # Limpiar restos de una ejecución interrumpida (archivos modificados sin commit)
+    # Limpiar restos de una ejecución interrumpida (archivos modificados sin commit).
+    # IMPORTANTE (paralelismo): solo se restauran los proyectos que ESTE proceso va a
+    # procesar; si se restaurasen todos, un worker desharía los commits a medio hacer
+    # de otro worker en proyectos ajenos.
     for name, path in pairs:
+        if own_projects is not None and name not in own_projects:
+            continue
         st = subprocess.run(["git", "-C", str(path), "status", "--porcelain"],
                             capture_output=True, text=True).stdout.strip()
         if st:
@@ -849,19 +1006,21 @@ def main():
         "skipped_no_file", "skipped_no_technique", "skipped_not_found",
         "candidates", "no_valid_candidate", "kept_original", "kept_committed",
         "kept_dry_run", "apply_failed", "methods_refactored", "llm_errors",
+        "batch_retries",
     ]}
 
     csvs = sorted(DATA_DIR.glob("final_methods_dataset_*.csv"))
     if args.project:
-        csvs = [c for c in csvs if c.name == f"final_methods_dataset_{args.project}.csv"]
+        names = {f"final_methods_dataset_{p}.csv" for p in args.project.split(",")}
+        csvs = [c for c in csvs if c.name in names]
 
-    done_keys = set() if args.fresh else load_done_keys()
+    done_keys = set() if args.fresh else load_done_keys(resume_path)
     if done_keys:
         print(f"[resume] {len(done_keys)} métodos ya procesados; se reanudará desde ahí")
 
     total = sum(len(pd.read_csv(c)) for c in csvs)
     labeled_total = sum(int((pd.read_csv(c)[TARGETS].sum(axis=1) > 0).sum()) for c in csvs)
-    progress = Progress(total, labeled_total)
+    progress = Progress(total, labeled_total, quiet=args.quiet)
 
     total_processed = 0
     for csv_path in csvs:
@@ -915,7 +1074,7 @@ def main():
                     continue
                 entries.append(ent)
                 # Trocear por presupuesto de tokens (dejamos siempre al menos 1)
-                if len(entries) > 1 and _batch_tokens(entries) > REFACTOR_BATCH_MAX_TOKENS:
+                if len(entries) > 1 and _batch_tokens(entries) > REFACTOR_BATCH_MAX_TOKENS * 0.8:
                     chunk, entries = entries[:-1], [entries[-1]]
                     for ent2, st in zip(chunk, process_batch(client, work_path, chunk,
                                                              args.dry_run, stats)):

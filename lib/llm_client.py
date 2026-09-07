@@ -157,7 +157,7 @@ class LLMClient:
 
             if resp.status_code == 200:
                 if stream:
-                    return self._consume_sse(resp)
+                    return self._consume_sse(resp, timeout or self.timeout)
                 data = resp.json()
                 content = data["choices"][0]["message"]["content"]
                 return content, data.get("usage")
@@ -173,12 +173,18 @@ class LLMClient:
         raise last_err if last_err else LLMError("Error desconocido al llamar al LLM")
 
     @staticmethod
-    def _consume_sse(resp):
-        """Lee una respuesta en streaming (SSE) y acumula content + usage."""
+    def _consume_sse(resp, timeout):
+        """Lee una respuesta en streaming (SSE) y acumula content + usage.
+        Guardia de reloj: si el stream lleva más de `timeout` segundos sin
+        terminar (aunque lleguen datos lentos), se aborta para no quedarse
+        colgado en streams silenciosos del gateway."""
         content = ""
         usage = None
+        deadline = time.time() + timeout
         try:
             for raw in resp.iter_lines(decode_unicode=True):
+                if time.time() > deadline:
+                    raise LLMError(f"stream agotó el tiempo de espera (>{timeout}s)")
                 if not raw or not raw.startswith("data:"):
                     continue
                 data = raw[5:].strip()

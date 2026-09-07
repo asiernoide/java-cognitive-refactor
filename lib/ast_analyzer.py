@@ -9,6 +9,19 @@ load_dotenv()
 
 JAVA_ANALYZER_JAR = "ast-analyzer/ast-analyzer.jar"
 
+# Último error de parseo (para feedback dirigido en el reintento de lotes).
+last_error: str | None = None
+
+
+def _first_error_line(stderr: str, max_len: int = 400) -> str:
+    """Extrae la primera línea significativa de error (Parse/Lexical error) del
+    stderr de JavaParser para usarla como feedback conciso en los reintentos."""
+    for line in stderr.splitlines():
+        s = line.strip()
+        if "Parse error" in s or "Lexical error" in s or s.startswith("Error al parsear"):
+            return s[:max_len]
+    return stderr.strip()[:max_len]
+
 # Directorio raíz del proyecto Java en disco.
 #
 # Las rutas relativas de los métodos incluyen el nombre del submódulo como
@@ -43,9 +56,12 @@ def analyze_method(file_path: str, line: int) -> dict | None:
         print("ERROR: No se encontró 'java' en el PATH o el JAR no existe.", file=sys.stderr)
         return None
 
+    global last_error
+    last_error = None
     if result.returncode != 0:
+        last_error = _first_error_line(result.stderr)
         print(f"  [WARN] Fallo al analizar {file_path}:{line}", file=sys.stderr)
-        print(f"  {result.stderr.strip()}", file=sys.stderr)
+        print(f"  {last_error}", file=sys.stderr)
         return None
 
     try:
@@ -78,9 +94,12 @@ def analyze_method_by_signature(file_path: str, signature: str) -> dict | None:
         print("ERROR: No se encontró 'java' en el PATH o el JAR no existe.", file=sys.stderr)
         return None
 
+    global last_error
+    last_error = None
     if result.returncode != 0:
+        last_error = _first_error_line(result.stderr)
         print(f"  [WARN] Fallo al analizar {file_path} por signatura {signature}", file=sys.stderr)
-        print(f"  {result.stderr.strip()}", file=sys.stderr)
+        print(f"  {last_error}", file=sys.stderr)
         return None
 
     try:
