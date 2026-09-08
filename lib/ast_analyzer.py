@@ -22,26 +22,13 @@ def _first_error_line(stderr: str, max_len: int = 400) -> str:
             return s[:max_len]
     return stderr.strip()[:max_len]
 
-# Directorio raíz del proyecto Java en disco.
-#
-# Las rutas relativas de los métodos incluyen el nombre del submódulo como
-# primer segmento cuando el proyecto es multi-módulo:
-#
-#   Módulo único:   src/main/java/com/example/UserService.java
-#   Multi-módulo:   jmetal-core/src/main/java/org/uma/jmetal/...
-#
-# En ambos casos basta con definir JAVA_SRC_ROOT apuntando a la raíz del
-# proyecto.
+# Raíz del proyecto Java (rutas relativas: módulo único o multi-módulo con el
+# submódulo como primer segmento).
 JAVA_SRC_ROOT = os.getenv("JAVA_SRC_ROOT", ".")
 
 
 def analyze_method(file_path: str, line: int) -> dict | None:
-    """
-    Ejecuta el analizador Java para un método concreto y devuelve
-    sus métricas AST como diccionario, o None si falla.
-
-    file_path debe ser la ruta absoluta al archivo Java.
-    """
+    """Analiza el método en `line` y devuelve sus métricas AST, o None si falla."""
     if not os.path.isfile(file_path):
         print(f"  [WARN] Archivo no encontrado en disco: {file_path}", file=sys.stderr)
         return None
@@ -72,14 +59,7 @@ def analyze_method(file_path: str, line: int) -> dict | None:
 
 
 def analyze_method_by_signature(file_path: str, signature: str) -> dict | None:
-    """
-    Ejecuta el analizador Java para un método localizado por su signatura
-    (`nombreMetodo(tipo1,tipo2)` o `Clase.nombreMetodo(tipo1,tipo2)`) y devuelve
-    sus métricas AST como diccionario, o None si falla.
-
-    La firma (nombre + tipos de parámetros) es única dentro de una clase, por lo
-    que sirve para localizar métodos tras un refactor, cuando las líneas cambian.
-    """
+    """Analiza el método por signatura (estable ante refactors, cuando las líneas cambian)."""
     if not os.path.isfile(file_path):
         print(f"  [WARN] Archivo no encontrado en disco: {file_path}", file=sys.stderr)
         return None
@@ -110,15 +90,7 @@ def analyze_method_by_signature(file_path: str, signature: str) -> dict | None:
 
 
 def scan_project_complex_methods(project_root: str, threshold: int = 15) -> pd.DataFrame:
-    """
-    Detección LOCAL de métodos complejos: ejecuta el analizador en modo `scan`
-    sobre el proyecto y devuelve un DataFrame con todos los métodos cuya
-    cognitive_complexity supera el umbral (por defecto 15).
-
-    Reemplaza la detección que antes hacía SonarQube (regla java:S3776):
-    recorre los .java del proyecto, calcula la CC localmente con JavaParser y
-    filtra CC > umbral.
-    """
+    """Detección LOCAL de métodos complejos (scan JavaParser, CC local, CC > umbral)."""
     result = subprocess.run(
         ["java", "-jar", JAVA_ANALYZER_JAR, "scan", project_root, str(threshold)],
         capture_output=True,
@@ -139,17 +111,8 @@ def scan_project_complex_methods(project_root: str, threshold: int = 15) -> pd.D
 
 
 def enrich_with_ast(df: pd.DataFrame, java_src_root: str | None = None) -> pd.DataFrame:
-    """
-    Recibe un DataFrame de métodos complejos y lo enriquece con métricas AST
-    ejecutando el analizador Java para cada método. Devuelve un nuevo DataFrame
-    con todas las columnas. Los métodos que no puedan analizarse se omiten.
-
-    Nota: el pipeline principal usa `scan_project_complex_methods` (detección
-    local), que ya devuelve las métricas completas; esta función es un helper
-    para enriquecer un conjunto de métodos concreto (por línea).
-
-    Si no se especifica java_src_root, se usa el directorio actual.
-    """
+    """Enriquece un DataFrame de métodos con métricas AST (por línea); helper,
+    el pipeline principal usa `scan_project_complex_methods`."""
     src_root = java_src_root or JAVA_SRC_ROOT
     if src_root == ".":
         print("[WARN] JAVA_SRC_ROOT no está definido — usando el directorio actual.")

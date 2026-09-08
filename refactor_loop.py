@@ -1,55 +1,25 @@
 """
 Bucle de refactorización con LLM.
 
-Para cada método del dataset con técnicas etiquetadas (1s), se generan
-candidatos refactorizados y se elige el mejor según el score penalizado
-S = ΔCC − λ·max(0, ΔCyclo); solo se aplica y commitea si S > 0. La copia
-original de projects/ queda intacta; el trabajo se hace en copias (out/).
+Para cada método del dataset con técnicas etiquetadas genera candidatos y elige
+el mejor por el score S = ΔCC − λ·max(0, ΔCyclo); aplica y commitea solo si
+S > 0. Trabaja sobre copias (out/), sin tocar projects/. En Extract Method la
+CC/Ciclomática del candidato es el TOTAL (principal + extraídos).
 
-Dos modos de llamada al LLM (REFACTOR_MODE):
-  - stream: una llamada por técnica y método.
-  - batch: agrupa varios métodos en UNA llamada (JSON). Los métodos que fallan
-    (no parsean, JSON inválido, etc.) se REINTENTAN en rondas dirigidas
-    (REFACTOR_BATCH_RETRIES) enviando el error exacto como feedback al LLM;
-    si el lote entero falla, se parte por la mitad. Usa streaming + guardia de
-    reloj adaptativa (el gateway corta las respuestas no-streaming largas).
-
-En Extract Method, la CC/Ciclomática del candidato es el TOTAL
-(método principal + suma de los métodos extraídos) para no reducir la CC
-artificialmente escondiendo lógica en sub-métodos.
+REFACTOR_MODE=stream: una llamada por técnica; batch: varios métodos en UNA
+llamada con reintentos dirigidos de los fallidos (error exacto como feedback) y
+streaming con guardia de reloj.
 
 Config (.env):
-    WORK_DIR                     copias de trabajo (default out)
-    CC_THRESHOLD                 objetivo de CC (default 15)
-    REFACTOR_CYCLO_PENALTY        lambda del score S(c)=ΔCC − λ·max(0, ΔCyclo)
-                                 (default 1; 0 = seleccionar solo por CC)
-    REFACTOR_MAX_CYCLO_DELTA_PCT red de seguridad opcional: % de aumento de
-                                 ciclomática permitido (0 = sin límite)
-    REFACTOR_SEED                semilla para el empate aleatorio (default 42)
-    REFACTOR_MAX_TOKENS          máx. tokens de salida por llamada en stream
-                                 (default 24000)
-    REFACTOR_MODE                stream | batch (default stream)
-    REFACTOR_BATCH_MAX_TOKENS    presupuesto de SALIDA por llamada batch
-                                 (default 100000; DeepSeek permite ~384k)
-    REFACTOR_BATCH_TIMEOUT       guardia de reloj mínima por llamada batch,
-                                 adaptativa al tamaño del lote (default 600s)
-    REFACTOR_BATCH_RETRIES       rondas de reintento dirigido de fallidos
-                                 (default 2)
-    REFACTOR_RUN_TESTS           never/auto/always: cronometrar la suite de
-                                 tests del proyecto antes/después del pase
-    LLM_*                        cliente OpenAI-compatible (lib/llm_client.py)
-
-La selección de la mejor versión usa un score con penalización:
-    S(c) = ΔCC(c) − λ · max(0, ΔCyclo(c))
-siendo ΔCC la reducción de complejidad cognitiva y ΔCyclo el aumento de
-complejidad ciclomática respecto al método original. Se elige el candidato
-de mayor S y solo se acepta si S > 0 (en caso contrario se mantiene el
-original). Las fórmulas están documentadas en la nota Semana 10 (Obsidian).
+    WORK_DIR, CC_THRESHOLD, REFACTOR_CYCLO_PENALTY (λ),
+    REFACTOR_MAX_CYCLO_DELTA_PCT, REFACTOR_SEED, REFACTOR_MAX_TOKENS,
+    REFACTOR_MODE, REFACTOR_BATCH_MAX_TOKENS, REFACTOR_BATCH_TIMEOUT,
+    REFACTOR_BATCH_RETRIES, REFACTOR_RUN_TESTS, LLM_* (ver README)
 
 Uso:
     python refactor_loop.py [--project X] [--limit N] [--dry-run]
-                           [--fresh] [--log FICHERO] [--resume FICHERO] [--quiet]
-    python run_parallel.py -n 4 [--fresh] [--resume FICHERO]   # paralelo
+                           [--fresh] [--log F] [--resume F] [--quiet]
+    python run_parallel.py -n 4 [--fresh] [--resume F]
 """
 
 import argparse
@@ -79,19 +49,9 @@ MAX_CYCLO_DELTA_PCT = float(os.getenv("REFACTOR_MAX_CYCLO_DELTA_PCT", "0"))
 SEED = int(os.getenv("REFACTOR_SEED", "42"))
 REFACTOR_MAX_TOKENS = int(os.getenv("REFACTOR_MAX_TOKENS", "24000"))
 RUN_TESTS = os.getenv("REFACTOR_RUN_TESTS", "never")
-# Modo de trabajo: "stream" = una llamada LLM por método (por defecto);
-# "batch" = agrupa varios métodos en UNA llamada (más barato en latencia).
-REFACTOR_MODE = os.getenv("REFACTOR_MODE", "stream")
-# Presupuesto de tokens de SALIDA por llamada en modo batch. DeepSeek V4 Flash
-# permite hasta ~384k de salida; con lotes grandes el coste por llamada es una
-# sola vez y los fallos se recuperan con reintentos dirigidos (ver abajo).
+REFACTOR_MODE = os.getenv("REFACTOR_MODE", "stream")  # stream | batch
 REFACTOR_BATCH_MAX_TOKENS = int(os.getenv("REFACTOR_BATCH_MAX_TOKENS", "100000"))
-# Timeout (guardia de reloj) por llamada en modo batch. Se ajusta en proceso
-# según el tamaño del lote (véase process_batch): guardia = max(este valor,
-# tiempo estimado de generación × 2).
-REFACTOR_BATCH_TIMEOUT = int(os.getenv("REFACTOR_BATCH_TIMEOUT", "600"))
-# Reintentos dirigidos: rondas extra que reenvían SOLO los métodos fallidos del
-# lote, indicando al LLM el error exacto para que lo corrija.
+REFACTOR_BATCH_TIMEOUT = int(os.getenv("REFACTOR_BATCH_TIMEOUT", "600"))  # guardia mínima, adaptativa
 REFACTOR_BATCH_RETRIES = int(os.getenv("REFACTOR_BATCH_RETRIES", "2"))
 
 TARGETS = [
@@ -185,9 +145,7 @@ def fmt_eta(seconds: float) -> str:
 
 
 class Progress:
-    """Progreso en vivo del bucle: una línea con \\r en terminal y una línea de
-    control (checkpoint) cada N métodos para poder seguir el avance desde el
-    fichero de salida cuando se ejecuta en segundo plano."""
+    """Progreso en vivo: línea \\r + checkpoint cada N métodos."""
 
     def __init__(self, total: int, labeled_total: int, checkpoint_every: int = 25,
                  quiet: bool = False):
@@ -205,8 +163,7 @@ class Progress:
     def update(self, status: str, labeled: bool = False, resumed: bool = False):
         self.processed += 1
         if resumed:
-            # Los reanudados se muestran una sola vez (via resume_skipped),
-            # no duplicados en counts con la clave "reanudado".
+            # los reanudados se cuentan una sola vez (via resume_skipped)
             self.resume_skipped += 1
         else:
             self.counts[status] = self.counts.get(status, 0) + 1
@@ -227,11 +184,7 @@ class Progress:
         return self.processed / elapsed if elapsed > 0 else 0.0, elapsed
 
     def _eta(self):
-        """ETA basado SOLO en el ritmo de los métodos etiquetados (los que hacen
-        trabajo LLM). El ritmo global mezcla los métodos instantáneos
-        (no_technique, not_found, reanudados) y deja el ETA demasiado optimista
-        (p. ej. '12 min' cuando faltan ~1h). Los métodos rápidos restantes se
-        estiman a ~60/s."""
+        """ETA por el ritmo de métodos etiquetados (los rápidos van a ~60/s)."""
         elapsed = time.time() - self.t0
         if self.labeled_done <= 0 or elapsed <= 0:
             return "?"
@@ -267,10 +220,7 @@ class Progress:
 
 
 def load_done_keys(resume_path: Path | None = None) -> set[tuple[str, str, int]]:
-    """Conjunto de métodos ya procesados (project, file, start_line) a partir de
-    las entradas del log con campo `status` (marcan el final del procesamiento
-    de un método). Permite reanudar sin repetir trabajo ni gastar tokens.
-    `resume_path` permite leer un log distinto del de salida (paralelismo)."""
+    """Métodos ya procesados (project, file, start_line) para reanudar sin repetir."""
     path = resume_path or LOG_PATH
     keys = set()
     if not path.exists():
@@ -373,9 +323,7 @@ def extract_source(full_path: Path, base: dict) -> str:
 
 
 def measure_method_snippet(source: str) -> dict | None:
-    """Mide CC/ciclomática/LOC/invocations de un método aislado (p.ej. un método
-    extraído por Extract Method) envolviéndolo en una clase temporal. Devuelve
-    las métricas o None si no parsea."""
+    """Mide un método aislado (p.ej. extraído) envolviéndolo en una clase temporal."""
     code = "class T {\n" + source + "\n}\n"
     tmp = None
     try:
@@ -391,13 +339,7 @@ def measure_method_snippet(source: str) -> dict | None:
 
 def try_technique(client, project: str, work_path: Path, rel_file: str, base: dict,
                   technique: str, locate_sig: str) -> dict | None:
-    """Aplica una técnica: LLM -> aplicar -> medir -> deshacer. Devuelve el
-    candidato con métricas, o None si el LLM no produjo algo válido.
-
-    `locate_sig` es la firma cualificada (enclosing_class.method_signature),
-    única dentro del fichero y estable ante refactors; se usa para re-localizar
-    el método tras aplicar el cambio (la firma simple puede ser ambigua en
-    clases internas y las líneas cambian tras el refactor)."""
+    """Aplica una técnica (LLM → aplicar → medir → deshacer) y devuelve el candidato."""
     full_path = work_path / rel_file
     source = extract_source(full_path, base)
     signature = base["method_signature"]
@@ -454,24 +396,15 @@ def try_technique(client, project: str, work_path: Path, rel_file: str, base: di
 def evaluate_candidate(work_path: Path, rel_file: str, base: dict, locate_sig: str,
                        technique: str, main_code: str, new_methods: list,
                        project: str, tokens: int = 0) -> dict | None:
-    """Aplica el candidato a la copia, mide, revierte y devuelve el dict del
-    candidato. Comparte la medición con el modo stream y el modo batch.
-    None si no valida (no parsea o cambia la firma).
-
-    CC/Ciclomática EFECTIVA: para Extract Method se suma la complejidad de los
-    métodos extraídos (si solo se midiera el método principal, la extracción
-    permitiría reducir la CC artificialmente "escondiendo" la lógica en
-    sub-métodos). Sin esa suma, el total podría incluso aumentar.
-    """
+    """Aplica → mide → revierte. En Extract la CC/Ciclomática del candidato es el
+    TOTAL (principal + extraídos), para no reducir la CC artificialmente."""
     full_path = work_path / rel_file
     signature = base["method_signature"]
 
     if not apply_candidate(full_path, base, main_code, new_methods):
         return None
 
-    # Medir tras el cambio (esto también valida que el archivo parsea).
-    # Se re-localiza por la firma CUALIFICADA (estable ante cambios de línea y
-    # sin ambigüedad de clases internas), no por la línea original.
+    # validar parseo y firma (re-localiza por firma cualificada, estable ante cambios)
     measured = ast.analyze_method_by_signature(str(full_path), locate_sig)
     workspace.git_restore(work_path, rel_file)  # deshacer el cambio
 
@@ -518,17 +451,8 @@ def evaluate_candidate(work_path: Path, rel_file: str, base: dict, locate_sig: s
 
 def select_best(candidates: list[dict], base_cc: int, base_cyclo: int) -> tuple[dict | None, float]:
     """
-    Selecciona el mejor candidato según el score con penalización:
-
-        S(c) = ΔCC(c) − λ · max(0, ΔCyclo(c))
-
-    donde ΔCC(c) = base_cc − c.cc (reducción de complejidad cognitiva) y
-    ΔCyclo(c) = c.cyclo − base_cyclo (aumento de complejidad ciclomática).
-
-    Solo se penaliza que la ciclomática suba (max(0, …)); si baja o se
-    mantiene no hay castigo. Devuelve (mejor_candidato, score); si el score
-    del mejor es <= 0, no merece la pena y debe mantenerse el original.
-    Empate de score -> menor ciclomática -> aleatorio (semilla fija).
+    Mejor candidato por S = ΔCC − λ·max(0, ΔCyclo); solo se aplica si S > 0.
+    Empates: menor ciclomática, luego aleatorio (semilla fija).
     """
     best = None
     best_key = None
@@ -608,12 +532,7 @@ def process_method(project: str, work_path: Path, row, client, dry_run: bool, st
                   status="no_technique")
         return "no_technique"
 
-    # Identidad ESTABLE del método desde el proyecto ORIGINAL (nunca modificado):
-    # la línea del CSV del dataset solo es válida en el original; la copia de
-    # trabajo puede haber cambiado de líneas tras refactors previos en el mismo
-    # archivo. La firma cualificada (enclosing_class.method_signature) es única
-    # dentro del fichero (desambigua clases internas, p.ej. JSONPath.SizeSegment)
-    # y no cambia con los refactors.
+    # Identidad estable desde el ORIGINAL: firma cualificada (única y estable ante refactors)
     orig_path = Path(PROJECTS_DIR) / project / rel_file
     orig_meta = ast.analyze_method(str(orig_path), start_line)
     if orig_meta is None:
@@ -655,8 +574,7 @@ def process_method(project: str, work_path: Path, row, client, dry_run: bool, st
 def finalize_method(project: str, work_path: Path, rel_file: str, start_line: int,
                     signature: str, locate_sig: str, base_cc: int, base_cyclo: int,
                     candidates: list[dict], dry_run: bool, stats: dict) -> str:
-    """Decide y aplica el mejor candidato con nuestros criterios (mismo flujo para
-    modo stream y batch): selección por score, aplicación permanente, commit, log."""
+    """Elige por score, aplica de forma permanente, commitea y loguea."""
     if not candidates:
         stats["no_valid_candidate"] += 1
         log_entry(project=project, file=rel_file, start_line=start_line,
@@ -665,7 +583,7 @@ def finalize_method(project: str, work_path: Path, rel_file: str, start_line: in
                   status="no_valid_candidate")
         return "no_valid_candidate"
 
-    # Red de seguridad opcional: cap porcentual de ciclomática (0 = sin límite)
+    # cap opcional de ciclomática (0 = sin límite)
     if MAX_CYCLO_DELTA_PCT > 0:
         ref_cyclo = base_cyclo if base_cyclo > 0 else 1
         allowed = [c for c in candidates
@@ -705,9 +623,7 @@ def finalize_method(project: str, work_path: Path, rel_file: str, start_line: in
                   reason=f"ninguna versión merece la pena (mejor score {score:.2f} <= 0)")
         return "keep_original"
 
-    # Re-localizar el método en la copia justo antes de aplicar: en modo batch
-    # varios métodos del mismo fichero pueden haberse aplicado antes y desplazar
-    # las líneas; la firma cualificada es estable ante esos cambios.
+    # Re-localizar por firma antes de aplicar (las líneas pueden haberse desplazado)
     full_path = work_path / rel_file
     current = ast.analyze_method_by_signature(str(full_path), locate_sig)
     if current is None or not apply_candidate(full_path, current, best["code"], best["new_methods"]):
@@ -742,11 +658,8 @@ def finalize_method(project: str, work_path: Path, rel_file: str, start_line: in
 
 
 def batch_entry(project: str, work_path: Path, row) -> tuple[dict | None, str | None]:
-    """Prepara un método para el modo batch. Devuelve (entry, error) donde error
-    es el estado si el método no puede entrar en el batch (no_file, no_technique,
-    not_found) o None si entra. La source se toma del proyecto ORIGINAL (baseline):
-    los métodos de un batch no se han refactorizado aún, por lo que la copia de
-    trabajo está idéntica al original."""
+    """Prepara un método para el batch: (entry, None) o (None, estado de error).
+    La source se toma del proyecto ORIGINAL (baseline)."""
     rel_file = str(row["file"])
     start_line = int(row["method_start_line"])
     full_path = work_path / rel_file
@@ -783,20 +696,15 @@ def batch_entry(project: str, work_path: Path, row) -> tuple[dict | None, str | 
 
 
 def _batch_tokens(entries: list[dict]) -> int:
-    """Estimación de los tokens de SALIDA del batch (lo que debe caber en
-    max_tokens): por cada método y técnica, una refactorización de tamaño ~ el
-    del método. Se usa el 80% del tope como margen: si un batch se pasa del
-    max_tokens el JSON llega truncado ('JSON sin cerrar') y se pierde el lote."""
+    """Estima los tokens de SALIDA del batch (deben caber en max_tokens, con margen)."""
     return int(sum(len(e["source"]) // 3 * max(1, len(e["techniques"])) + 200
                    for e in entries))
 
 
 def _batch_call(client, entries: list[dict], stats: dict,
                 errors: dict | None = None) -> tuple[dict | None, dict | None]:
-    """Una llamada batch (streaming + guardia de reloj adaptativa). Devuelve
-    (data, usage) o (None, None) si fallan los 3 intentos. Con `errors`
-    (dict id -> mensaje de error) reenvía solo los métodos fallidos indicando al
-    LLM el error exacto para que lo corrija (prompt de reintento)."""
+    """Una llamada batch (streaming + guardia de reloj). Con `errors` reenvía los
+    fallidos con el error exacto (prompt de reintento)."""
     project = entries[0]["project"]
     methods = []
     for i, e in enumerate(entries):
@@ -807,8 +715,7 @@ def _batch_call(client, entries: list[dict], stats: dict,
         methods.append(m)
     user = json.dumps({"methods": methods}, ensure_ascii=False)
     system = SYSTEM_PROMPT_BATCH_RETRY if errors else SYSTEM_PROMPT_BATCH
-    # Guardia de reloj adaptativa: la generación va a ~75 tok/s; doble margen.
-    est = _batch_tokens(entries)
+    est = _batch_tokens(entries)  # guardia adaptativa (~75 tok/s)
     guard = max(REFACTOR_BATCH_TIMEOUT, int(est / 75) * 2 + 120)
     for attempt in range(3):
         try:
@@ -835,9 +742,7 @@ def _group_refactors(data: dict | None) -> dict[int, list[dict]]:
 
 def _evaluate_batch_method(work_path: Path, entry: dict, refactors: list[dict],
                            batch_tokens: int, stats: dict) -> tuple[list[dict], str]:
-    """Evalúa los refactors devueltos para un método (aplicar→medir→revertir).
-    Devuelve (candidatos, error_concat) donde error_concat está vacío si hay
-    candidatos o contiene el/los motivos del fallo (para el feedback dirigido)."""
+    """Evalúa los refactors de un método; devuelve (candidatos, error_concatenado)."""
     candidates = []
     errors = []
     for r in refactors:
@@ -866,9 +771,7 @@ def _evaluate_batch_method(work_path: Path, entry: dict, refactors: list[dict],
 
 def _retry_batch(client, work_path: Path, failed: list[tuple[dict, str]],
                  batch_tokens: int, stats: dict, retries_left: int):
-    """Rondas de reintento dirigido sobre la lista (entry, error). Devuelve
-    (results_fixed, still_failed). Cada ronda reenvía SOLO los métodos fallidos
-    con el error exacto como feedback."""
+    """Reintenta solo los fallidos con su error exacto; devuelve (resueltos, pendientes)."""
     results = []
     while failed and retries_left > 0:
         retries_left -= 1
@@ -877,7 +780,7 @@ def _retry_batch(client, work_path: Path, failed: list[tuple[dict, str]],
         errors = {i: err for i, (_, err) in enumerate(failed)}
         data, _usage = _batch_call(client, entries, stats, errors=errors)
         if data is None:
-            # El reintento también falló del todo: partir y reintentar cada mitad
+            # si el reintento falla del todo, partir y reintentar cada mitad
             if len(entries) > 1:
                 mid = len(entries) // 2
                 r1, f1 = _retry_batch(client, work_path, failed[:mid], batch_tokens,
@@ -901,13 +804,11 @@ def _retry_batch(client, work_path: Path, failed: list[tuple[dict, str]],
 
 def process_batch(client, work_path: Path, entries: list[dict], dry_run: bool,
                   stats: dict) -> list[str]:
-    """Procesa un lote de métodos: UNA llamada grande con todos (aprovechando el
-    output amplio de DeepSeek) y reintentos dirigidos de los que fallan, pasando
-    al LLM el error exacto. Después cada método con candidatos se decide y aplica
-    con los criterios habituales (select_best, log). Devuelve el estado por método."""
+    """Procesa un lote: una llamada grande + reintentos de los fallidos; luego
+    decide y aplica cada método con los criterios habituales."""
     data, usage = _batch_call(client, entries, stats)
     if data is None:
-        # Fallo total del lote: partir por la mitad y reintentar cada parte.
+        # fallo total del lote: partir por la mitad y reintentar
         if len(entries) > 1:
             mid = len(entries) // 2
             return (process_batch(client, work_path, entries[:mid], dry_run, stats)
@@ -1003,10 +904,7 @@ def main():
     pairs = workspace.ensure_workspace(PROJECTS_DIR, WORK_DIR, only=own_projects)
     work_map = {name: path for name, path in pairs}
 
-    # Limpiar restos de una ejecución interrumpida (archivos modificados sin commit).
-    # IMPORTANTE (paralelismo): solo se restauran los proyectos que ESTE proceso va a
-    # procesar; si se restaurasen todos, un worker desharía los commits a medio hacer
-    # de otro worker en proyectos ajenos.
+    # Limpiar restos de ejecuciones interrumpidas; en paralelo solo los proyectos propios
     for name, path in pairs:
         if own_projects is not None and name not in own_projects:
             continue

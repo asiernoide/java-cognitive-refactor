@@ -1,20 +1,7 @@
 """
-Workspace de refactor: copias de trabajo de los proyectos en out/.
-
-Cada proyecto de projects/ se clona localmente (git clone --local, usa
-hardlinks para los objetos de git) en WORK_DIR/<proyecto>. El refactor se
-aplica sobre la copia; projects/ queda intacto con sus referencias previas.
-La copia conserva su .git, por lo que se puede restaurar (git restore/reset)
-sin regenerar nada.
-
-Config (.env):
-    WORK_DIR   directorio de trabajo (default 'out')
-
-Uso:
-    from lib import workspace
-    pairs = workspace.ensure_workspace("projects")   # [(nombre, Path), ...]
-    workspace.git_restore(pairs[0][1], "ruta/relativa.java")
-    workspace.git_commit(pairs[0][1], "refactor: ...")
+Workspace de refactor: copias de trabajo de los proyectos en out/ (WORK_DIR).
+Cada proyecto se clona localmente; el refactor se aplica sobre la copia y
+projects/ queda intacto. Uso: ensure_workspace, git_restore, git_commit.
 """
 
 import os
@@ -38,8 +25,7 @@ def _has_commits(repo: Path) -> bool:
 
 
 def _git_init_and_initial_commit(repo: Path) -> None:
-    """Inicializa git en una copia literal y crea un commit inicial, para que
-    el restore por git funcione aunque el proyecto original no tuviera historial."""
+    """Git init + commit inicial para poder restaurar copias sin historial previo."""
     subprocess.run(["git", "init"], cwd=str(repo), check=True)
     subprocess.run(["git", "add", "-A"], cwd=str(repo), check=True)
     subprocess.run(
@@ -52,16 +38,8 @@ def _git_init_and_initial_commit(repo: Path) -> None:
 
 def ensure_workspace(projects_dir: str, work_dir: str | None = None,
                      only: list[str] | set[str] | None = None) -> list[tuple[str, Path]]:
-    """
-    Garantiza una copia de trabajo (clon local) de cada proyecto en work_dir.
-    Idempotente: si la copia ya existe y tiene .git con contenido, la reutiliza.
-    Si el proyecto original no tiene historial git, se copia literalmente y se
-    inicializa git con un commit inicial (restore por git igualmente posible).
-    `only` (opcional): lista de nombres de proyecto; si se da, solo se asegura
-    el workspace de esos proyectos (evita que workers paralelos clonen los
-    mismos directorios a la vez).
-    Devuelve [(nombre_proyecto, ruta_copia), ...].
-    """
+    """Clona (o reutiliza) cada proyecto en work_dir. `only` limita a unos proyectos.
+    Devuelve [(nombre, ruta), ...]."""
     projects_dir = Path(projects_dir)
     work_dir = Path(work_dir or WORK_DIR)
     work_dir.mkdir(parents=True, exist_ok=True)

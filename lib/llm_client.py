@@ -1,30 +1,10 @@
 """
-Cliente OpenAI-compatible para el LLM (refactorización guiada).
-
-Contrato único: POST {base}/chat/completions, de modo que funciona con
-OpenAI, OpenRouter, Ollama, LM Studio, vLLM, etc. sin lógica específica
-de modelo. Toda la configuración se lee de variables de entorno (.env):
-
-    LLM_BASE_URL    URL base de la API (default https://api.openai.com/v1)
-    LLM_API_KEY     Clave de API (cabecera Bearer)
-    LLM_MODEL       Nombre del modelo (default gpt-4o-mini)
-    LLM_TEMPERATURE Temperatura (default 0.2, determinismo para refactor)
-    LLM_MAX_TOKENS  Máximo de tokens por respuesta (default 2048)
-    LLM_TIMEOUT     Timeout de la petición en segundos (default 120)
-    LLM_REASONING_EFFORT  Esfuerzo de razonamiento para modelos con thinking
-                    (p.ej. DeepSeek V4: low/high/max; default: no se envía)
-
-Uso:
-    from lib import llm_client
-    client = llm_client.LLMClient()
-    text, usage = client.chat([{"role": "user", "content": "..."}])
-    data, usage = client.chat_json([...])   # devuelve dict parseado
-
-Probe (para comprobar la API key / proveedor):
-    python lib/llm_client.py
+Cliente OpenAI-compatible para el LLM (contrato único: POST {base}/chat/completions,
+vale para OpenAI, OpenRouter, Ollama, etc.). Config vía variables de entorno LLM_*
+(LLM_BASE_URL, LLM_API_KEY, LLM_MODEL, LLM_TEMPERATURE, LLM_MAX_TOKENS,
+LLM_TIMEOUT, LLM_REASONING_EFFORT). Probe: python lib/llm_client.py
 """
 
-import json
 import json
 import os
 import time
@@ -45,9 +25,7 @@ MAX_RETRIES = 2
 
 
 def _load_session_id() -> str:
-    """ID de sesión estable para el header x-opencode-session de OpenCode Go.
-    Se puede fijar con OPENCODE_SESSION_ID; si no, se genera un UUID persistente
-    (una única identidad por conversación/herramienta)."""
+    """ID de sesión estable (header x-opencode-session); OPENCODE_SESSION_ID o UUID persistente."""
     env = os.getenv("OPENCODE_SESSION_ID")
     if env:
         return env
@@ -99,9 +77,8 @@ class LLMClient:
 
     def chat(self, messages, json_mode=False, temperature=None, max_tokens=None,
              reasoning_effort=None, timeout=None, stream=False):
-        """Envía un chat y devuelve (contenido, usage). usage es dict o None.
-        Con stream=True lee la respuesta por SSE (necesario para generaciones
-        largas: el gateway corta las respuestas no-streaming que tardan mucho)."""
+        """Envía un chat y devuelve (contenido, usage). stream=True lee SSE (necesario
+        para generaciones largas: el gateway corta las no-streaming)."""
         url = f"{self.base_url}/chat/completions"
         payload = {
             "model": self.model,
@@ -174,10 +151,7 @@ class LLMClient:
 
     @staticmethod
     def _consume_sse(resp, timeout):
-        """Lee una respuesta en streaming (SSE) y acumula content + usage.
-        Guardia de reloj: si el stream lleva más de `timeout` segundos sin
-        terminar (aunque lleguen datos lentos), se aborta para no quedarse
-        colgado en streams silenciosos del gateway."""
+        """Lee SSE acumulando content + usage, con guardia de reloj (evita streams silenciosos)."""
         content = ""
         usage = None
         deadline = time.time() + timeout

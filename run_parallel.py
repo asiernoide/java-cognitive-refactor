@@ -1,21 +1,11 @@
 """Lanzador paralelo del bucle de refactorización.
 
-Reparte los proyectos entre N workers, cada uno en su propio proceso (su propio
-workspace y su propio log), y fusiona los logs parciales en el log principal.
-
-Modelo de concurrencia (seguro):
-  - Cada proyecto lo procesa UN solo worker (agrupaciones disjuntas), por lo que
-    no hay conflictos de git en out/<proyecto>.
-  - Cada worker escribe en data/refactor_log_w<k>.jsonl (log único por proceso).
-  - Los métodos ya hechos se leen del log PRINCIPAL (solo lectura en arranque);
-    al terminar se fusionan los logs de worker en el principal (append).
-  - Cada worker usa un OPENCODE_SESSION_ID distinto para no compartir sesión en
-    peticiones concurrentes.
+Reparte los proyectos entre N workers (cada uno en su propio proceso y log) y
+fusiona los logs parciales en el principal. Cada proyecto lo procesa un solo
+worker (sin conflictos git) y cada worker usa un OPENCODE_SESSION_ID distinto.
 
 Uso:
-    python run_parallel.py -n 4            # ejecución completa con 4 workers
-    python run_parallel.py -n 4 --fresh    # ignora reanudación
-    python run_parallel.py -n 3 --dry-run --limit 4   # prueba rápida
+    python run_parallel.py -n 4 [--fresh] [--dry-run --limit N] [--resume F]
 """
 
 import argparse
@@ -42,8 +32,7 @@ def project_groups(workers: int) -> list[list[str]]:
 
 
 def merge_worker_logs() -> int:
-    """Fusiona los logs de worker en el principal (orden cronológico) y los borra.
-    Devuelve el número de entradas fusionadas."""
+    """Fusiona los logs de worker en el principal y los borra; devuelve nº de entradas."""
     worker_logs = sorted(DATA.glob(WORKER_LOG_PATTERN))
     if not worker_logs:
         return 0

@@ -141,6 +141,8 @@ En **Extract Method**, la CC/Ciclomática del candidato se mide como **total = m
 
 ## Uso
 
+**Flujo completo:** (1) detectar y etiquetar los métodos (`main.py` + `metrics_classifier.py`), (2) refactorizarlos con LLM (`refactor_loop.py` o `run_parallel.py`), (3) generar el dataset de entrenamiento desde el log (`data/build_refactor_dataset.py`).
+
 ### 1. Pipeline completo (detección local → AST → CSV)
 
 ```bash
@@ -206,6 +208,15 @@ java -jar ast-analyzer/ast-analyzer.jar <archivo.java> "MiClase.nombreMetodo(int
 ```
 
 La búsqueda por signatura es necesaria en el refactor iterativo: tras editar el archivo, las líneas cambian pero la signatura se mantiene.
+
+### 6. Dataset de entrenamiento desde el log
+
+```bash
+python data/build_refactor_dataset.py --log data/refactor_log_lambda_05.jsonl \
+    --out data/refactor_training_dataset_lambda_05.csv
+```
+
+A partir del log de una ejecución genera un CSV consolidado (con columna `project`) en el que cada método del dataset **original** conserva sus métricas y las columnas de técnica tienen **un único `1`** en la técnica que el bucle escogió de verdad (el refactor aplicado, del `status=kept` del log); el resto va a 0 y los métodos no refactorizados quedan con todo a 0. No usa el heurístico: el `1` refleja la técnica ganadora según el score. Listo para entrenar modelos ML que predigan la técnica más adecuada.
 
 ---
 
