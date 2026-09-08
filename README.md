@@ -137,6 +137,8 @@ En **Extract Method**, la CC/Ciclomática del candidato se mide como **total = m
 
 `REFACTOR_MODE` elige cómo se hacen las llamadas LLM: `stream` (default) hace **una llamada por técnica y método**; `batch` agrupa varios métodos en **una sola llamada** (JSON: entrada `{"methods":[{id, signature, techniques, source}]}` → salida `{"refactors":[{id, technique, main_method, new_methods}]}`) y luego evalúa cada candidato con los mismos criterios (`select_best`, log). En batch, los métodos que fallan (no parsean, JSON inválido, ausentes) se **reintentan en rondas dirigidas** (`REFACTOR_BATCH_RETRIES`, default 2) reenviando solo esos métodos con el **error exacto** (Parse/Lexical) como feedback al LLM para que lo corrijan; si un lote entero falla, se parte por la mitad y se reintenta. `REFACTOR_BATCH_MAX_TOKENS` es el presupuesto de **salida** por llamada (default `100000`; DeepSeek V4 Flash permite hasta ~384k, así que cada llamada puede llevar decenas de métodos) y `REFACTOR_BATCH_TIMEOUT` es la guardia de reloj mínima (default `600`s), adaptativa al tamaño del lote. Las llamadas del batch usan **streaming** (el gateway cierra las respuestas no-streaming que tardan demasiado) con guardia de reloj para no quedarse colgado en streams silenciosos.
 
+> **⚠️ Verificación de tests — experimental.** Con `REFACTOR_RUN_TESTS=auto/always` el bucle cronometra la suite de tests del proyecto antes y después del pase. Es una funcionalidad **experimental**: puede no funcionar en algunos proyectos (submódulos, dependencias no resueltas, tiempos de compilación excesivos o ausencia de build tool). Los refactors se validan siempre por **parseo** (JavaParser); la ejecución de tests no es necesaria para el funcionamiento del resto del pipeline.
+
 ---
 
 ## Uso
