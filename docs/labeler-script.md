@@ -89,7 +89,7 @@ Cada técnica recibe una puntuación:
 | Lambda Reduce | 3 | Patrón directo |
 | Extract Method | 2 | Heurística compuesta |
 
-Se seleccionan las **2 técnicas con mayor puntuación**. Si hay empate, se usa el orden alfabético del nombre de columna. Las técnicas con puntuación 0 no se seleccionan.
+Se seleccionan las **2 técnicas con mayor puntuación**. Si hay empate, se prioriza la técnica con **mayor valor de su métrica de activación** (la métrica que la activa cuando es > 0; en `extract_method`, el número de condiciones de su heurística). Las técnicas con puntuación 0 no se seleccionan.
 
 Esto significa que si un método tiene simultáneamente `collapse_ifs` y `lambda_map`, se marcan ambos. Si además cumple `extract_method`, se descarta este último por tener menor puntuación.
 

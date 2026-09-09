@@ -34,28 +34,34 @@ def classify_from_metrics(row: pd.Series) -> dict[str, int]:
       - 3 puntos: patrones directos (collapse, map, filter_map, reduce)
       - 2 puntos: heuristica compuesta (extract_method)
 
-    Se seleccionan las 2 tecnicas con mayor puntuacion (maximo 2 labels = 1).
+    Se seleccionan las 2 tecnicas con mayor puntuacion (maximo 2 labels = 1);
+    en caso de empate se prioriza la de mayor valor de su metrica de activacion.
     """
     scores: dict[str, int] = {}
+    track: dict[str, int] = {}
 
     # ── Collapse ifs (&&) ──
     # nested_if_chains > 0 indica cadenas de if anidados sin else colapsables
     if row["nested_if_chains"] > 0:
         scores["refactor_collapse_ifs_with_and"] = 3
+        track["refactor_collapse_ifs_with_and"] = int(row["nested_if_chains"])
 
     # ── Lambda Map ──
     # map_candidate_loops > 0: foreach con un unico statement simple
     if row["map_candidate_loops"] > 0:
         scores["refactor_lambda_map"] = 3
+        track["refactor_lambda_map"] = int(row["map_candidate_loops"])
 
     # ── Lambda Filter + Map ──
     if row["filter_map_candidate_loops"] > 0:
         scores["refactor_lambda_filter_map"] = 3
+        track["refactor_lambda_filter_map"] = int(row["filter_map_candidate_loops"])
 
     # ── Lambda Reduce ──
     # reduce_candidate_loops > 0: foreach con acumulacion y a lo sumo un if de guarda
     if row["reduce_candidate_loops"] > 0:
         scores["refactor_lambda_reduce"] = 3
+        track["refactor_lambda_reduce"] = int(row["reduce_candidate_loops"])
 
     # ── Extract Method ──
     # Heuristica compuesta: metodo grande + mucha estructura interna
@@ -78,9 +84,10 @@ def classify_from_metrics(row: pd.Series) -> dict[str, int]:
 
     if extract_score >= 2:
         scores["refactor_extract_method"] = 2
+        track["refactor_extract_method"] = extract_score
 
-    # ── Seleccionar top 2 ──
-    ordered = sorted(scores.items(), key=lambda kv: (-kv[1], kv[0]))
+    # ── Seleccionar top 2: puntuacion desc; empate -> mayor metrica de activacion ──
+    ordered = sorted(scores.items(), key=lambda kv: (-kv[1], -track[kv[0]]))
     chosen = {name for name, score in ordered[:2] if score >= 2}
 
     return {t: 1 if t in chosen else 0 for t in TARGETS}
