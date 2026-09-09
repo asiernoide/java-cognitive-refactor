@@ -1,4 +1,6 @@
-/projects
+# projects/ no se versiona salvo el aviso de cabecera
+/projects/*
+!/projects/PON_TUS_PROYECTOS_DE_JAVA_AQUI.txt
 /.idea
 __pycache__/
 *.pyc

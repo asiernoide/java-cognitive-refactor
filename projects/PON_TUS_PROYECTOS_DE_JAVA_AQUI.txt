@@ -1,0 +1,10 @@
+Coloca aqui los proyectos Java que quieras analizar.
+
+Cada subcarpeta de esta carpeta se trata como un proyecto independiente
+(una subcarpeta por proyecto, p. ej. `projects/mi-proyecto/`).
+
+Los proyectos en si no se versionan en este repositorio: esta carpeta se
+ignora en `.gitignore` y solo se mantiene este aviso para que la estructura
+quede documentada. Los proyectos deben tener una estructura estandar
+(p. ej. con `pom.xml`, `build.gradle` o `build.xml`) para que el analizador
+AST autodetecte las raices de fuentes (`src/main/java` o `src`).
