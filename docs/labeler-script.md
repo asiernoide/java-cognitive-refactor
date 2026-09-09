@@ -1,24 +1,6 @@
 # Clasificador de refactorizaciones por reglas sobre métricas
 
-## Contexto
-
-`metrics_classifier.py` es un clasificador determinista que asigna etiquetas de refactorización a métodos Java basándose **exclusivamente en las métricas estructurales del CSV**, sin leer el código fuente.
-
-### Evolución del enfoque de etiquetado
-
-El proyecto pasó por tres fases en su estrategia de clasificación:
-
-1. **Script basado en código fuente** — Inicialmente se desarrolló un etiquetador que analizaba directamente el cuerpo de cada método Java, imitando el criterio de un revisor humano. El objetivo era generar etiquetas automáticas para luego validar manualmente un porcentaje, agilizando la anotación del dataset.
-
-2. **Experimento con Machine Learning** — Se entrenó un Random Forest sobre las etiquetas del script. El modelo funcionó aceptablemente para `extract_method` (F1=0.87) y `collapse_ifs` (F1=0.63), pero fracasó en los labels de streams/lambdas debido a la fuerte disparidad entre clases (solo 8 métodos de 989 tenían `filter_map`). La conclusión fue que las etiquetas del script basado en código fuente eran intrínsecamente mejores que cualquier etiqueta que un ML pudiera producir entrenándose sobre métricas agregadas.
-
-3. **Clasificador por reglas sobre métricas** — Se descartó el ML y se refinó el etiquetado para operar exclusivamente sobre las 16 métricas del CSV, incluyendo 5 métricas nuevas (`return_count`, `try_catch_count`, `switch_case_count`, `loop_body_max_statements`, `parameter_count`) añadidas al analizador AST porque el script original ya las utilizaba implícitamente en sus decisiones. El resultado es `metrics_classifier.py`: reglas deterministas, transparentes y sin dependencia de los archivos fuente.
-
-## Objetivo
-
-Dado un método con sus métricas estructurales, determinar cuál de 5 técnicas de refactorización es aplicable. El script asigna **hasta 2 técnicas por método**, priorizando las más específicas sobre las más generales.
-
----
+`metrics_classifier.py` asigna a cada método Java hasta **dos de las cinco técnicas** de refactorización consideradas, aplicando reglas deterministas sobre las métricas estructurales del CSV (**sin leer el código fuente**). La clasificación es transparente y reproducible: cada técnica se activa con condiciones explícitas sobre una métrica (patrón directo) o con una heurística compuesta.
 
 ## Técnicas de refactorización y reglas de activación
 
@@ -30,7 +12,7 @@ Transforma `if` anidados directamente en una sola condición compuesta.
 |---|---|
 | Se activa si hay **al menos 1** cadena de `if` anidados sin `else` | `nested_if_chains > 0` |
 
-La métrica `nested_if_chains` cuenta cadenas del tipo `if(a) { if(b) { ... } }` donde el `if` interior no tiene `else`. Estas son directamente colapsables con `&&` sin alterar la semántica.
+`nested_if_chains` cuenta cadenas del tipo `if(a) { if(b) { ... } }` donde el `if` interior no tiene `else`. Son directamente colapsables con `&&` sin alterar la semántica.
 
 ### 2. Lambda Map (`refactor_lambda_map`)
 
@@ -75,8 +57,6 @@ Extrae un bloque lógico del método a un nuevo método privado.
 
 **Se activa si se cumplen al menos 2 de las 4 condiciones anteriores.**
 
----
-
 ## Priorización
 
 Cada técnica recibe una puntuación:
@@ -89,11 +69,9 @@ Cada técnica recibe una puntuación:
 | Lambda Reduce | 3 | Patrón directo |
 | Extract Method | 2 | Heurística compuesta |
 
-Se seleccionan las **2 técnicas con mayor puntuación**. Si hay empate, se prioriza la técnica con **mayor valor de su métrica de activación** (la métrica que la activa cuando es > 0; en `extract_method`, el número de condiciones de su heurística). Las técnicas con puntuación 0 no se seleccionan.
+Se seleccionan las **2 técnicas con mayor puntuación**. Si hay empate, se prioriza la técnica con **mayor valor de su métrica de activación** (la métrica que la activa cuando es `> 0`; en `extract_method`, el número de condiciones cumplidas de su heurística). Las técnicas con puntuación inferior a 2 no se seleccionan.
 
-Esto significa que si un método tiene simultáneamente `collapse_ifs` y `lambda_map`, se marcan ambos. Si además cumple `extract_method`, se descarta este último por tener menor puntuación.
-
----
+Por ejemplo, un método con `nested_if_chains` y `map_candidate_loops` positivos recibe las etiquetas `collapse_ifs` y `lambda_map`; si además cumpliera la heurística de `extract_method`, esta se descarta por tener menor puntuación.
 
 ## Entrada y salida
 
@@ -104,18 +82,13 @@ Esto significa que si un método tiene simultáneamente `collapse_ifs` y `lambda
 
 El CSV de salida contiene todas las columnas originales más 5 columnas nuevas con el sufijo `_metrics` (ej: `refactor_extract_method_metrics`), con valor `1` o `0`.
 
-Además, si el CSV de entrada ya contiene columnas de refactorización (por ejemplo, del etiquetador original basado en código fuente de la Fase 1), el script imprime una comparativa: porcentaje de acierto y recall por label.
-
----
+Además, si el CSV de entrada ya contiene columnas de refactorización (etiquetas de referencia), el script imprime una comparativa: porcentaje de acierto y recall por label.
 
 ## Uso
 
 ```bash
-cd java-cognitive-refactor/
 python metrics_classifier.py
 ```
-
----
 
 ## Limitaciones
 
