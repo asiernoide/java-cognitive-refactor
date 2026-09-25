@@ -1,10 +1,11 @@
 """
 Bucle de refactorización con LLM.
 
-Para cada método del dataset con técnicas etiquetadas genera candidatos y elige
-el mejor por el score S = ΔCC − λ·max(0, ΔCyclo); aplica y commitea solo si
-S > 0. Trabaja sobre copias (out/), sin tocar projects/. En Extract Method la
-CC/Ciclomática del candidato es el TOTAL (principal + extraídos).
+Lee el dataset clasificado (analysis/output/aggregated_method_data_metrics_labels.csv,
+columnas refactor_* = 1) y, para cada método, genera candidatos y elige el mejor
+por el score S = ΔCC − λ·max(0, ΔCyclo); aplica y commitea solo si S > 0. Trabaja
+sobre copias (out/), sin tocar projects/. En Extract Method la CC/Ciclomática del
+candidato es el TOTAL (principal + extraídos).
 
 REFACTOR_MODE=stream: una llamada por técnica; batch: varios métodos en UNA
 llamada con reintentos dirigidos de los fallidos (error exacto como feedback) y
@@ -14,7 +15,7 @@ Config (.env):
     WORK_DIR, CC_THRESHOLD, REFACTOR_CYCLO_PENALTY (λ),
     REFACTOR_MAX_CYCLO_DELTA_PCT, REFACTOR_SEED, REFACTOR_MAX_TOKENS,
     REFACTOR_MODE, REFACTOR_BATCH_MAX_TOKENS, REFACTOR_BATCH_TIMEOUT,
-    REFACTOR_BATCH_RETRIES, REFACTOR_RUN_TESTS, LLM_* (ver README)
+    REFACTOR_BATCH_RETRIES, REFACTOR_RUN_TESTS, SHOW_TERMINAL, LLM_* (ver README)
 
 Uso:
     python refactor_loop.py [--project X] [--limit N] [--dry-run]
@@ -36,7 +37,7 @@ import pandas as pd
 from dotenv import load_dotenv
 
 from lib import ast_analyzer as ast
-from lib import llm_client, workspace
+from lib import llm_client, progress_monitor, workspace
 
 load_dotenv()
 
@@ -53,6 +54,18 @@ REFACTOR_MODE = os.getenv("REFACTOR_MODE", "stream")  # stream | batch
 REFACTOR_BATCH_MAX_TOKENS = int(os.getenv("REFACTOR_BATCH_MAX_TOKENS", "100000"))
 REFACTOR_BATCH_TIMEOUT = int(os.getenv("REFACTOR_BATCH_TIMEOUT", "600"))  # guardia mínima, adaptativa
 REFACTOR_BATCH_RETRIES = int(os.getenv("REFACTOR_BATCH_RETRIES", "2"))
+# Deadline para una generación individual en modo stream (una técnica), por si el
+# método es grande. El corte por stream silencioso lo aplica LLM_STALL_TIMEOUT.
+REFACTOR_STREAM_TIMEOUT = int(os.getenv("REFACTOR_STREAM_TIMEOUT", "1800"))
+# Último recurso: reintentar en modo stream (una llamada por método/técnica) los
+# métodos que agotan los reintentos de batch.
+REFACTOR_STREAM_FALLBACK = os.getenv("REFACTOR_STREAM_FALLBACK", "1").strip().lower() \
+    in ("1", "true", "yes", "on")
+# Límites por llamada batch: nº de métodos y tokens de SALIDA estimados. Si se
+# superan, el JSON del modelo se trunca (respuesta vacía/incompleta), así que el
+# lote se trocea antes de llamar.
+REFACTOR_BATCH_MAX_METHODS = int(os.getenv("REFACTOR_BATCH_MAX_METHODS", "3"))
+REFACTOR_BATCH_OUTPUT_BUDGET = int(os.getenv("REFACTOR_BATCH_OUTPUT_BUDGET", "6000"))
 
 TARGETS = [
     "refactor_extract_method",
@@ -61,6 +74,10 @@ TARGETS = [
     "refactor_lambda_filter_map",
     "refactor_lambda_reduce",
 ]
+
+# Estados terminales que NO se reintentan al reanudar; el resto (llm_error,
+# not_found, no_valid_candidate, apply_failed) sí se reintenta.
+SETTLED_STATUSES = {"kept", "keep_original", "no_technique", "no_file"}
 
 TECHNIQUE_DESC = {
     "refactor_extract_method": (
@@ -133,6 +150,12 @@ SYSTEM_PROMPT_BATCH_RETRY = (
 
 RNG = random.Random(SEED)
 LOG_PATH = DATA_DIR / "refactor_log.jsonl"
+# Dataset clasificado (main.py -> aggregate_method_data.py -> metrics_classifier.py):
+# es la fuente del bucle; incluye la columna `project` y las técnicas `refactor_*`.
+CLASSIFIED_DATASET = (
+    Path(__file__).resolve().parent / "analysis" / "output"
+    / "aggregated_method_data_metrics_labels.csv"
+)
 
 
 # ---------------------------------------------------------------------------
@@ -231,8 +254,9 @@ def load_done_keys(resume_path: Path | None = None) -> set[tuple[str, str, int]]
                 e = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            if e.get("status") and e.get("status") != "llm_error" \
-                    and e.get("start_line") is not None:
+            # Solo los estados "asentados" cuentan como hechos; los fallos
+            # (llm_error, not_found, no_valid_candidate, apply_failed) se reintentan.
+            if e.get("status") in SETTLED_STATUSES and e.get("start_line") is not None:
                 keys.add((e["project"], e["file"], int(e["start_line"])))
     return keys
 
@@ -272,7 +296,7 @@ def clean_code(content: str) -> str:
     return code
 
 
-def reindent(code: str, base_indent: str, eol: str):
+def reindent(code: str, base_indent: str) -> list[str]:
     """Normaliza la indentación del bloque devuelto por el LLM usando como
     referencia relativa la indentación de la primera línea no vacía (la firma
     del método), y la re-posiciona a la indentación base del método original."""
@@ -287,7 +311,7 @@ def reindent(code: str, base_indent: str, eol: str):
             out.append(base_indent + " " * rel + l.strip())
         else:
             out.append("")
-    return out, eol
+    return out
 
 
 def apply_candidate(full_path: Path, base: dict, main_code: str, new_methods: list[str]) -> bool:
@@ -299,11 +323,11 @@ def apply_candidate(full_path: Path, base: dict, main_code: str, new_methods: li
         return False
     eol = file_eol(full_path)
     base_indent = re.match(r"^[ \t]*", lines[start - 1]).group(0)
-    block, eol = reindent(main_code, base_indent, eol)
+    block = reindent(main_code, base_indent)
 
     replacement = [l + eol for l in block]
     for nm in new_methods or []:
-        nm_block, _ = reindent(nm, base_indent, eol)
+        nm_block = reindent(nm, base_indent)
         replacement.append(eol)  # línea en blanco separadora
         replacement.extend(l + eol for l in nm_block)
 
@@ -337,52 +361,56 @@ def measure_method_snippet(source: str) -> dict | None:
             os.unlink(tmp)
 
 
-def try_technique(client, project: str, work_path: Path, rel_file: str, base: dict,
-                  technique: str, locate_sig: str) -> dict | None:
-    """Aplica una técnica (LLM → aplicar → medir → deshacer) y devuelve el candidato."""
-    full_path = work_path / rel_file
-    source = extract_source(full_path, base)
-    signature = base["method_signature"]
+def looks_like_java_method(code: str) -> bool:
+    """Guard: rechaza salidas vacías o que no parecen un método Java."""
+    stripped = (code or "").strip()
+    return len(stripped) >= 20 and "(" in stripped and "{" in stripped
 
+
+def request_refactor(client, technique: str, signature: str, source: str):
+    """Pide al LLM el refactor de un método y devuelve (main_code, new_methods, usage).
+
+    Extract Method usa el contrato JSON (main_method + new_methods); el resto de
+    técnicas devuelven solo el código Java del método.
+    """
     if technique == "refactor_extract_method":
-        system = SYSTEM_PROMPT_JSON
         user = (
             f"Refactor this method to reduce its cognitive complexity using the technique: "
             f"{TECHNIQUE_DESC[technique]}. Keep the exact signature `{signature}` for "
             "main_method. Do not change behavior.\n\n```java\n" + source + "\n```"
         )
-        try:
-            data, usage = client.chat_json([
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ], max_tokens=REFACTOR_MAX_TOKENS)
-        except llm_client.LLMError as e:
-            log_entry(project=project, file=rel_file, signature=signature,
-                      technique=technique, reason=f"LLM error: {e}", valid=False)
-            return None
-        main_code = data.get("main_method", "")
-        new_methods = data.get("new_methods") or []
-    else:
-        system = SYSTEM_PROMPT
-        user = (
-            f"Refactor this method to reduce its cognitive complexity using the technique: "
-            f"{TECHNIQUE_DESC[technique]}. Keep the exact signature `{signature}`. "
-            "Do not change behavior. Return only the Java code.\n\n```java\n" + source + "\n```"
-        )
-        try:
-            content, usage = client.chat([
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ], max_tokens=REFACTOR_MAX_TOKENS)
-        except llm_client.LLMError as e:
-            log_entry(project=project, file=rel_file, signature=signature,
-                      technique=technique, reason=f"LLM error: {e}", valid=False)
-            return None
-        main_code = clean_code(content)
-        new_methods = []
+        data, usage = client.chat_json([
+            {"role": "system", "content": SYSTEM_PROMPT_JSON},
+            {"role": "user", "content": user},
+        ], max_tokens=REFACTOR_MAX_TOKENS, timeout=REFACTOR_STREAM_TIMEOUT, stream=True)
+        return data.get("main_method", ""), data.get("new_methods") or [], usage
 
-    # Guard: rechazar salidas vacías o que no parecen un método Java
-    if not main_code.strip() or len(main_code.strip()) < 20 or "(" not in main_code or "{" not in main_code:
+    user = (
+        f"Refactor this method to reduce its cognitive complexity using the technique: "
+        f"{TECHNIQUE_DESC[technique]}. Keep the exact signature `{signature}`. "
+        "Do not change behavior. Return only the Java code.\n\n```java\n" + source + "\n```"
+    )
+    content, usage = client.chat([
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": user},
+    ], max_tokens=REFACTOR_MAX_TOKENS, timeout=REFACTOR_STREAM_TIMEOUT, stream=True)
+    return clean_code(content), [], usage
+
+
+def try_technique(client, project: str, work_path: Path, rel_file: str, base: dict,
+                  technique: str, locate_sig: str) -> dict | None:
+    """Aplica una técnica (LLM → aplicar → medir → deshacer) y devuelve el candidato."""
+    source = extract_source(work_path / rel_file, base)
+    signature = base["method_signature"]
+
+    try:
+        main_code, new_methods, usage = request_refactor(client, technique, signature, source)
+    except llm_client.LLMError as e:
+        log_entry(project=project, file=rel_file, signature=signature,
+                  technique=technique, reason=f"LLM error: {e}", valid=False)
+        return None
+
+    if not looks_like_java_method(main_code):
         log_entry(project=project, file=rel_file, signature=signature,
                   technique=technique, reason="salida del LLM vacía o demasiado corta",
                   valid=False)
@@ -514,6 +542,40 @@ def run_tests_timed(project_path: Path) -> dict | None:
 # Bucle principal
 # ---------------------------------------------------------------------------
 
+def techniques_for(row) -> list[str]:
+    """Técnicas activas (refactor_* = 1) de una fila del dataset clasificado."""
+    return [t for t in TARGETS if int(row.get(t) or 0) == 1]
+
+
+def locate_original(project: str, rel_file: str, start_line: int):
+    """Localiza el método en el proyecto ORIGINAL y devuelve su identidad estable.
+
+    Devuelve (orig_path, firma cualificada, métricas) o None si no se encuentra.
+    La firma cualificada "Clase.nombre(tipos)" es única y sobrevive a los refactors.
+    """
+    orig_path = Path(PROJECTS_DIR) / project / rel_file
+    orig_meta = ast.analyze_method(str(orig_path), start_line)
+    if orig_meta is None:
+        return None
+    enclosing = orig_meta.get("enclosing_class") or ""
+    locate_sig = f"{enclosing}.{orig_meta['method_signature']}" if enclosing \
+        else orig_meta["method_signature"]
+    return orig_path, locate_sig, orig_meta
+
+
+def generate_stream_candidates(client, project: str, work_path: Path, rel_file: str,
+                               base: dict, techniques: list[str], locate_sig: str,
+                               stats: dict) -> list[dict]:
+    """Genera candidatos en modo stream (una llamada LLM por técnica)."""
+    candidates = []
+    for t in techniques:
+        cand = try_technique(client, project, work_path, rel_file, base, t, locate_sig)
+        if cand is not None:
+            candidates.append(cand)
+        stats["candidates"] += 1
+    return candidates
+
+
 def process_method(project: str, work_path: Path, row, client, dry_run: bool, stats: dict) -> str:
     """Procesa un método y devuelve su estado (checkpoint de reanudación)."""
     rel_file = str(row["file"])
@@ -525,7 +587,7 @@ def process_method(project: str, work_path: Path, row, client, dry_run: bool, st
                   status="no_file", reason="archivo no existe en la copia")
         return "no_file"
 
-    techniques = [t for t in TARGETS if int(row.get(t) or 0) == 1]
+    techniques = techniques_for(row)
     if not techniques:
         stats["skipped_no_technique"] += 1
         log_entry(project=project, file=rel_file, start_line=start_line,
@@ -533,18 +595,14 @@ def process_method(project: str, work_path: Path, row, client, dry_run: bool, st
         return "no_technique"
 
     # Identidad estable desde el ORIGINAL: firma cualificada (única y estable ante refactors)
-    orig_path = Path(PROJECTS_DIR) / project / rel_file
-    orig_meta = ast.analyze_method(str(orig_path), start_line)
-    if orig_meta is None:
+    located = locate_original(project, rel_file, start_line)
+    if located is None:
         stats["skipped_not_found"] += 1
         log_entry(project=project, file=rel_file, start_line=start_line,
                   technique="any", reason="método no localizado en el proyecto original",
                   status="not_found", valid=False)
         return "not_found"
-
-    enclosing = orig_meta.get("enclosing_class") or ""
-    locate_sig = f"{enclosing}.{orig_meta['method_signature']}" if enclosing \
-        else orig_meta["method_signature"]
+    _orig_path, locate_sig, orig_meta = located
 
     # Localizar en la COPIA por firma cualificada (estable ante cambios de línea)
     base = ast.analyze_method_by_signature(str(full_path), locate_sig)
@@ -556,54 +614,46 @@ def process_method(project: str, work_path: Path, row, client, dry_run: bool, st
                   status="not_found", valid=False)
         return "not_found"
 
-    signature = base["method_signature"]
-    base_cc = int(base["cognitive_complexity"])
-    base_cyclo = int(base["cyclomatic_complexity"])
-
-    candidates = []
-    for t in techniques:
-        cand = try_technique(client, project, work_path, rel_file, base, t, locate_sig)
-        if cand is not None:
-            candidates.append(cand)
-        stats["candidates"] += 1
-
-    return finalize_method(project, work_path, rel_file, start_line, signature,
-                           locate_sig, base_cc, base_cyclo, candidates, dry_run, stats)
+    candidates = generate_stream_candidates(client, project, work_path, rel_file,
+                                            base, techniques, locate_sig, stats)
+    return finalize_method(project, work_path, rel_file, start_line,
+                           base["method_signature"], locate_sig,
+                           int(base["cognitive_complexity"]),
+                           int(base["cyclomatic_complexity"]),
+                           candidates, dry_run, stats)
 
 
-def finalize_method(project: str, work_path: Path, rel_file: str, start_line: int,
-                    signature: str, locate_sig: str, base_cc: int, base_cyclo: int,
-                    candidates: list[dict], dry_run: bool, stats: dict) -> str:
-    """Elige por score, aplica de forma permanente, commitea y loguea."""
-    if not candidates:
-        stats["no_valid_candidate"] += 1
+def _apply_cyclo_cap(project: str, rel_file: str, start_line: int, signature: str,
+                     base_cc: int, base_cyclo: int, candidates: list[dict],
+                     stats: dict) -> list[dict] | None:
+    """Filtra candidatos por el cap opcional de ciclomática (0 = sin límite).
+
+    Devuelve la lista permitida, o None si todos superan el cap (mantener original).
+    """
+    if MAX_CYCLO_DELTA_PCT <= 0:
+        return candidates
+
+    ref_cyclo = base_cyclo if base_cyclo > 0 else 1
+    allowed = [c for c in candidates
+               if (c["cyclo"] - ref_cyclo) / ref_cyclo * 100 <= MAX_CYCLO_DELTA_PCT]
+    if allowed:
         log_entry(project=project, file=rel_file, start_line=start_line,
-                  signature=signature, base_cc=base_cc,
-                  reason="ninguna técnica generó un candidato válido",
-                  status="no_valid_candidate")
-        return "no_valid_candidate"
+                  signature=signature, base_cc=base_cc, base_cyclo=base_cyclo,
+                  reason=f"descartados candidatos con Δciclomática > {MAX_CYCLO_DELTA_PCT}%")
+        return allowed
 
-    # cap opcional de ciclomática (0 = sin límite)
-    if MAX_CYCLO_DELTA_PCT > 0:
-        ref_cyclo = base_cyclo if base_cyclo > 0 else 1
-        allowed = [c for c in candidates
-                   if (c["cyclo"] - ref_cyclo) / ref_cyclo * 100 <= MAX_CYCLO_DELTA_PCT]
-        if allowed:
-            candidates = allowed
-            log_entry(project=project, file=rel_file, start_line=start_line,
-                      signature=signature, base_cc=base_cc, base_cyclo=base_cyclo,
-                      reason=f"descartados candidatos con Δciclomática > {MAX_CYCLO_DELTA_PCT}%")
-        else:
-            stats["kept_original"] += 1
-            log_entry(project=project, file=rel_file, start_line=start_line,
-                      signature=signature, base_cc=base_cc, base_cyclo=base_cyclo,
-                      status="keep_original", decision="keep_original",
-                      reason="todos los candidatos superan el límite de ciclomática (safety)")
-            return "keep_original"
+    stats["kept_original"] += 1
+    log_entry(project=project, file=rel_file, start_line=start_line,
+              signature=signature, base_cc=base_cc, base_cyclo=base_cyclo,
+              status="keep_original", decision="keep_original",
+              reason="todos los candidatos superan el límite de ciclomática (safety)")
+    return None
 
-    # Selección por score penalizado: S = ΔCC − λ·max(0, ΔCyclo)
-    best, score = select_best(candidates, base_cc, base_cyclo)
 
+def log_candidates(project: str, rel_file: str, start_line: int, signature: str,
+                   base_cc: int, base_cyclo: int, candidates: list[dict],
+                   best: dict | None) -> None:
+    """Registra el score de cada candidato válido (solo el mejor queda kept=True)."""
     for c in candidates:
         log_entry(project=project, file=rel_file, start_line=start_line,
                   signature=signature, technique=c["technique"],
@@ -615,15 +665,11 @@ def finalize_method(project: str, work_path: Path, rel_file: str, start_line: in
                   score=c.get("score"), tokens=c["tokens"],
                   valid=True, kept=(c is best))
 
-    if score <= 0:
-        stats["kept_original"] += 1
-        log_entry(project=project, file=rel_file, start_line=start_line,
-                  signature=signature, base_cc=base_cc, base_cyclo=base_cyclo,
-                  status="keep_original", decision="keep_original",
-                  reason=f"ninguna versión merece la pena (mejor score {score:.2f} <= 0)")
-        return "keep_original"
 
-    # Re-localizar por firma antes de aplicar (las líneas pueden haberse desplazado)
+def apply_best_candidate(project: str, work_path: Path, rel_file: str, start_line: int,
+                         signature: str, locate_sig: str, base_cc: int, base_cyclo: int,
+                         best: dict, dry_run: bool, stats: dict) -> str:
+    """Aplica el mejor candidato (re-localizando por firma) y lo deja o lo deshace."""
     full_path = work_path / rel_file
     current = ast.analyze_method_by_signature(str(full_path), locate_sig)
     if current is None or not apply_candidate(full_path, current, best["code"], best["new_methods"]):
@@ -657,6 +703,41 @@ def finalize_method(project: str, work_path: Path, rel_file: str, start_line: in
     return "kept"
 
 
+def finalize_method(project: str, work_path: Path, rel_file: str, start_line: int,
+                    signature: str, locate_sig: str, base_cc: int, base_cyclo: int,
+                    candidates: list[dict], dry_run: bool, stats: dict) -> str:
+    """Elige por score, aplica de forma permanente, commitea y loguea."""
+    if not candidates:
+        stats["no_valid_candidate"] += 1
+        log_entry(project=project, file=rel_file, start_line=start_line,
+                  signature=signature, base_cc=base_cc,
+                  reason="ninguna técnica generó un candidato válido",
+                  status="no_valid_candidate")
+        return "no_valid_candidate"
+
+    # cap opcional de ciclomática (0 = sin límite)
+    candidates = _apply_cyclo_cap(project, rel_file, start_line, signature,
+                                  base_cc, base_cyclo, candidates, stats)
+    if candidates is None:
+        return "keep_original"
+
+    # Selección por score penalizado: S = ΔCC − λ·max(0, ΔCyclo)
+    best, score = select_best(candidates, base_cc, base_cyclo)
+    log_candidates(project, rel_file, start_line, signature, base_cc, base_cyclo,
+                   candidates, best)
+
+    if score <= 0:
+        stats["kept_original"] += 1
+        log_entry(project=project, file=rel_file, start_line=start_line,
+                  signature=signature, base_cc=base_cc, base_cyclo=base_cyclo,
+                  status="keep_original", decision="keep_original",
+                  reason=f"ninguna versión merece la pena (mejor score {score:.2f} <= 0)")
+        return "keep_original"
+
+    return apply_best_candidate(project, work_path, rel_file, start_line, signature,
+                                locate_sig, base_cc, base_cyclo, best, dry_run, stats)
+
+
 def batch_entry(project: str, work_path: Path, row) -> tuple[dict | None, str | None]:
     """Prepara un método para el batch: (entry, None) o (None, estado de error).
     La source se toma del proyecto ORIGINAL (baseline)."""
@@ -665,17 +746,14 @@ def batch_entry(project: str, work_path: Path, row) -> tuple[dict | None, str | 
     full_path = work_path / rel_file
     if not full_path.is_file():
         return None, "no_file"
-    techniques = [t for t in TARGETS if int(row.get(t) or 0) == 1]
+    techniques = techniques_for(row)
     if not techniques:
         return None, "no_technique"
 
-    orig_path = Path(PROJECTS_DIR) / project / rel_file
-    orig_meta = ast.analyze_method(str(orig_path), start_line)
-    if orig_meta is None:
+    located = locate_original(project, rel_file, start_line)
+    if located is None:
         return None, "not_found"
-    enclosing = orig_meta.get("enclosing_class") or ""
-    locate_sig = f"{enclosing}.{orig_meta['method_signature']}" if enclosing \
-        else orig_meta["method_signature"]
+    orig_path, locate_sig, orig_meta = located
 
     base = ast.analyze_method_by_signature(str(full_path), locate_sig)
     if base is None:
@@ -715,8 +793,11 @@ def _batch_call(client, entries: list[dict], stats: dict,
         methods.append(m)
     user = json.dumps({"methods": methods}, ensure_ascii=False)
     system = SYSTEM_PROMPT_BATCH_RETRY if errors else SYSTEM_PROMPT_BATCH
-    est = _batch_tokens(entries)  # guardia adaptativa (~75 tok/s)
-    guard = max(REFACTOR_BATCH_TIMEOUT, int(est / 75) * 2 + 120)
+    est = _batch_tokens(entries)  # guardia adaptativa
+    # Deadline TOTAL generoso: la salida de extract_method puede ser enorme (p. ej.
+    # ~90k tokens en un método grande). El corte por stream silencioso lo hace
+    # LLM_STALL_TIMEOUT en el cliente, así que aquí podemos permitir mucho tiempo.
+    guard = min(2400, max(REFACTOR_BATCH_TIMEOUT, int(est / 30) * 3 + 300))
     for attempt in range(3):
         try:
             data, usage = client.chat_json([
@@ -752,8 +833,7 @@ def _evaluate_batch_method(work_path: Path, entry: dict, refactors: list[dict],
         if technique not in entry["techniques"]:
             errors.append(f"técnica '{technique}' no permitida")
             continue
-        if not main_code.strip() or len(main_code.strip()) < 20 \
-                or "(" not in main_code or "{" not in main_code:
+        if not looks_like_java_method(main_code):
             errors.append("salida vacía o demasiado corta")
             continue
         cand = evaluate_candidate(work_path, entry["rel_file"], entry["base"],
@@ -769,15 +849,19 @@ def _evaluate_batch_method(work_path: Path, entry: dict, refactors: list[dict],
     return candidates, " | ".join(dict.fromkeys(errors))
 
 
-def _retry_batch(client, work_path: Path, failed: list[tuple[dict, str]],
+def _retry_batch(client, work_path: Path, failed: list[tuple[int, dict, str]],
                  batch_tokens: int, stats: dict, retries_left: int):
-    """Reintenta solo los fallidos con su error exacto; devuelve (resueltos, pendientes)."""
+    """Reintenta solo los fallidos con su error exacto; devuelve (resueltos, pendientes).
+
+    Cada elemento conserva su índice original en el lote (primer campo) para
+    poder devolver los estados alineados con las entradas del lote.
+    """
     results = []
     while failed and retries_left > 0:
         retries_left -= 1
         stats["batch_retries"] += 1
-        entries = [e for e, _ in failed]
-        errors = {i: err for i, (_, err) in enumerate(failed)}
+        entries = [e for _i, e, _err in failed]
+        errors = {pos: err for pos, (_i, _e, err) in enumerate(failed)}
         data, _usage = _batch_call(client, entries, stats, errors=errors)
         if data is None:
             # si el reintento falla del todo, partir y reintentar cada mitad
@@ -791,15 +875,44 @@ def _retry_batch(client, work_path: Path, failed: list[tuple[dict, str]],
             break
         by_id = _group_refactors(data)
         new_failed = []
-        for i, (e, _old) in enumerate(failed):
-            cands, err = _evaluate_batch_method(work_path, e, by_id.get(i, []),
+        for pos, (i, e, _old) in enumerate(failed):
+            cands, err = _evaluate_batch_method(work_path, e, by_id.get(pos, []),
                                                 batch_tokens, stats)
             if cands:
-                results.append((e, cands))
+                results.append((i, e, cands))
             else:
-                new_failed.append((e, err or "el LLM no devolvió ningún refactor válido"))
+                new_failed.append((i, e, err or "el LLM no devolvió ningún refactor válido"))
         failed = new_failed
     return results, failed
+
+
+def _stream_fallback(client, work_path: Path, entry: dict, dry_run: bool, stats: dict) -> str | None:
+    """Último recurso para un método que agotó los reintentos de batch: reintento
+    individual (modo stream), una llamada por técnica. Devuelve el estado final
+    (vía finalize_method) o None si no generó ningún candidato válido."""
+    candidates = generate_stream_candidates(client, entry["project"], work_path,
+                                            entry["rel_file"], entry["base"],
+                                            entry["techniques"], entry["locate_sig"], stats)
+    if not candidates:
+        return None
+    return finalize_method(entry["project"], work_path, entry["rel_file"], entry["start_line"],
+                           entry["signature"], entry["locate_sig"], entry["base_cc"],
+                           entry["base_cyclo"], candidates, dry_run, stats)
+
+
+def _fallback_or_error(client, work_path: Path, entry: dict, dry_run: bool,
+                       stats: dict, reason: str) -> str:
+    """Aplica el fallback stream; si tampoco resuelve, registra llm_error (que se
+    reintentará al reanudar). Devuelve el estado final."""
+    if REFACTOR_STREAM_FALLBACK:
+        status = _stream_fallback(client, work_path, entry, dry_run, stats)
+        if status is not None:
+            return status
+    stats["llm_errors"] += 1
+    log_entry(project=entry["project"], file=entry["rel_file"], start_line=entry["start_line"],
+              signature=entry["signature"], base_cc=entry["base_cc"],
+              reason=f"{reason} (batch+stream)", status="llm_error", valid=False)
+    return "llm_error"
 
 
 def process_batch(client, work_path: Path, entries: list[dict], dry_run: bool,
@@ -807,19 +920,17 @@ def process_batch(client, work_path: Path, entries: list[dict], dry_run: bool,
     """Procesa un lote: una llamada grande + reintentos de los fallidos; luego
     decide y aplica cada método con los criterios habituales."""
     data, usage = _batch_call(client, entries, stats)
+
+    # Fallo total del lote (sin JSON válido): partir por la mitad y, en el caso
+    # base (un único método), intentar el fallback stream.
     if data is None:
-        # fallo total del lote: partir por la mitad y reintentar
         if len(entries) > 1:
             mid = len(entries) // 2
             return (process_batch(client, work_path, entries[:mid], dry_run, stats)
                     + process_batch(client, work_path, entries[mid:], dry_run, stats))
-        for e in entries:
-            stats["llm_errors"] += 1
-            log_entry(project=e["project"], file=e["rel_file"], start_line=e["start_line"],
-                      signature=e["signature"], base_cc=e["base_cc"],
-                      reason="el batch no respondió JSON válido (incl. en solitario)",
-                      status="llm_error", valid=False)
-        return ["llm_error"]
+        return [_fallback_or_error(client, work_path, e, dry_run, stats,
+                                   "el batch no respondió JSON válido (incl. en solitario)")
+                for e in entries]
 
     project = entries[0]["project"]
     batch_tokens = (usage or {}).get("total_tokens", 0)
@@ -827,41 +938,39 @@ def process_batch(client, work_path: Path, entries: list[dict], dry_run: bool,
               tokens=batch_tokens)
 
     # Evaluación inicial: separar métodos OK de fallidos (con su error)
-    results = []    # (entry, candidates)
-    failed = []     # (entry, error)
+    results = []    # (índice en entries, entry, candidates)
+    failed = []     # (índice en entries, entry, error)
     by_id = _group_refactors(data)
     for i, e in enumerate(entries):
         cands, err = _evaluate_batch_method(work_path, e, by_id.get(i, []),
                                             batch_tokens, stats)
         if cands:
-            results.append((e, cands))
+            results.append((i, e, cands))
         else:
-            failed.append((e, err))
+            failed.append((i, e, err))
 
     # Reintentos dirigidos con feedback del error exacto
     fixed, still_failed = _retry_batch(client, work_path, failed, batch_tokens,
                                        stats, REFACTOR_BATCH_RETRIES)
     results.extend(fixed)
 
-    # Métodos que siguen fallando: llm_error (NO final; se reintentarán al reanudar)
-    for e, err in still_failed:
-        stats["llm_errors"] += 1
-        log_entry(project=e["project"], file=e["rel_file"], start_line=e["start_line"],
-                  signature=e["signature"], base_cc=e["base_cc"],
-                  reason=f"falló tras reintentos: {err[:200]}",
-                  status="llm_error", valid=False)
+    # Mismo orden de ejecución de siempre (primero los fallidos y luego los
+    # resueltos), pero devolviendo cada estado en la posición de su entrada.
+    statuses: dict[int, str] = {}
+    for i, e, err in still_failed:
+        statuses[i] = _fallback_or_error(client, work_path, e, dry_run, stats,
+                                         f"falló tras reintentos: {err[:200]}")
 
     # Decidir y aplicar cada método con candidatos (mismo criterio que stream)
-    statuses = []
-    for e, candidates in results:
-        statuses.append(finalize_method(e["project"], work_path, e["rel_file"],
-                                        e["start_line"], e["signature"], e["locate_sig"],
-                                        e["base_cc"], e["base_cyclo"], candidates,
-                                        dry_run, stats))
-    return statuses
+    for i, e, candidates in results:
+        statuses[i] = finalize_method(e["project"], work_path, e["rel_file"],
+                                      e["start_line"], e["signature"], e["locate_sig"],
+                                      e["base_cc"], e["base_cyclo"], candidates,
+                                      dry_run, stats)
+    return [statuses[i] for i in range(len(entries))]
 
 
-def main():
+def parse_args():
     parser = argparse.ArgumentParser(description="Bucle de refactorización con LLM")
     parser.add_argument("--project", help="Proyecto concreto (carpeta en projects/)")
     parser.add_argument("--limit", type=int, help="Máximo de métodos a procesar")
@@ -874,7 +983,140 @@ def main():
                         "reanudar (default: el mismo que --log)")
     parser.add_argument("--quiet", action="store_true",
                         help="Sin línea de progreso en vivo (usar en ejecuciones paralelas)")
-    args = parser.parse_args()
+    return parser.parse_args()
+
+
+def _prepare_workspaces(own_projects) -> dict[str, Path]:
+    """Crea/reutiliza las copias de trabajo y limpia restos de ejecuciones interrumpidas."""
+    pairs = workspace.ensure_workspace(PROJECTS_DIR, WORK_DIR, only=own_projects)
+    for name, path in pairs:
+        st = subprocess.run(["git", "-C", str(path), "status", "--porcelain"],
+                            capture_output=True, text=True).stdout.strip()
+        if st:
+            print(f"[limpieza] {name}: se restauran {len(st.splitlines())} archivos "
+                  f"modificados (ejecución anterior interrumpida)")
+            subprocess.run(["git", "-C", str(path), "restore", "."], check=True)
+    return {name: path for name, path in pairs}
+
+
+def load_classified_dataset(args) -> "pd.DataFrame | None":
+    """Lee el dataset clasificado y lo filtra por --project (None si no existe)."""
+    if not CLASSIFIED_DATASET.is_file():
+        print(f"ERROR: no existe el dataset clasificado {CLASSIFIED_DATASET}. "
+              f"Ejecuta main.py, data/aggregate_method_data.py y metrics_classifier.py.")
+        return None
+    dataset = pd.read_csv(CLASSIFIED_DATASET)
+    if args.project:
+        selected = set(args.project.split(","))
+        dataset = dataset[dataset["project"].isin(selected)]
+    return dataset
+
+
+def _pending_rows(project: str, df, done_keys: set, limit_left: int | None,
+                  progress: "Progress") -> tuple[list, int]:
+    """Separa las filas ya procesadas (reanudación) de las pendientes.
+
+    `limit_left` es el cupo restante de --limit (None = sin límite). Devuelve
+    (pendientes, filas consumidas), contando también las reanudadas.
+    """
+    pending = []
+    consumed = 0
+    for _, row in df.iterrows():
+        if limit_left is not None and limit_left <= 0:
+            break
+        key = (project, str(row["file"]), int(row["method_start_line"]))
+        if key in done_keys:
+            progress.update("reanudado", labeled=False, resumed=True)
+        else:
+            pending.append((key, row))
+        consumed += 1
+        if limit_left is not None:
+            limit_left -= 1
+    return pending, consumed
+
+
+def _run_batch_chunk(project: str, work_path: Path, chunk: list[dict], client,
+                     dry_run: bool, done_keys: set, stats: dict, progress: "Progress") -> None:
+    """Procesa un trozo de lote y actualiza los checkpoints y el progreso."""
+    for ent, status in zip(chunk, process_batch(client, work_path, chunk, dry_run, stats)):
+        done_keys.add((project, ent["rel_file"], ent["start_line"]))
+        progress.update(status, labeled=True)
+
+
+def _process_pending_batch(project: str, work_path: Path, pending: list, client,
+                           dry_run: bool, done_keys: set, stats: dict,
+                           progress: "Progress") -> None:
+    """Modo batch: prepara las entradas, trocea por límites y procesa cada lote."""
+    entries = []
+    for key, row in pending:
+        ent, err = batch_entry(project, work_path, row)
+        if ent is None:
+            if err == "no_technique":
+                stats["skipped_no_technique"] += 1
+            elif err == "no_file":
+                stats["skipped_no_file"] += 1
+            else:
+                stats["skipped_not_found"] += 1
+            fields = dict(project=project, file=str(row["file"]),
+                          start_line=int(row["method_start_line"]),
+                          status=err, valid=err != "no_technique")
+            if err == "not_found":
+                fields["reason"] = "método no localizado en el proyecto original"
+            log_entry(**fields)
+            done_keys.add(key)
+            progress.update(err, labeled=err not in ("no_file", "no_technique", "not_found"))
+            continue
+        entries.append(ent)
+        # Trocear por nº de métodos y presupuesto de tokens de salida
+        # (dejamos siempre al menos 1 en `entries`)
+        if len(entries) > 1 and (
+                len(entries) > REFACTOR_BATCH_MAX_METHODS
+                or _batch_tokens(entries) > REFACTOR_BATCH_OUTPUT_BUDGET):
+            chunk, entries = entries[:-1], [entries[-1]]
+            _run_batch_chunk(project, work_path, chunk, client, dry_run,
+                             done_keys, stats, progress)
+    if entries:
+        _run_batch_chunk(project, work_path, entries, client, dry_run,
+                         done_keys, stats, progress)
+
+
+def _process_pending_stream(project: str, work_path: Path, pending: list, client,
+                            dry_run: bool, done_keys: set, stats: dict,
+                            progress: "Progress") -> None:
+    """Modo stream: una llamada LLM por técnica y método."""
+    for key, row in pending:
+        status = process_method(project, work_path, row, client, dry_run, stats)
+        done_keys.add(key)  # checkpoint en memoria ante cortes
+        progress.update(status, labeled=status not in ("no_file", "no_technique", "not_found"))
+
+
+def _maybe_baseline_tests(project: str, work_path: Path, dry_run: bool) -> dict | None:
+    """Baseline de la suite del proyecto antes de refactorizar (REFACTOR_RUN_TESTS)."""
+    if RUN_TESTS not in ("auto", "always") or dry_run:
+        return None
+    tool = detect_build_tool(work_path)
+    has_tests = (work_path / "src" / "test").exists() or (work_path / "test").exists()
+    if tool and (RUN_TESTS == "always" or has_tests):
+        print(f"[tests] baseline {project} ...")
+        return run_tests_timed(work_path)
+    return None
+
+
+def _run_after_tests(project: str, work_path: Path, baseline: dict | None) -> None:
+    """Repite la suite tras el pase del proyecto y registra los tiempos."""
+    if baseline is None:
+        return
+    after = run_tests_timed(work_path)
+    log_entry(event="tests", project=project,
+              baseline_seconds=baseline.get("wall_seconds"),
+              baseline_success=baseline.get("success"),
+              after_seconds=after.get("wall_seconds") if after else None,
+              after_success=after.get("success") if after else None)
+    print(f"[tests] {project}: baseline={baseline} after={after}")
+
+
+def main():
+    args = parse_args()
 
     if args.log:
         global LOG_PATH
@@ -900,20 +1142,13 @@ def main():
         LOG_PATH.unlink()
         print("[fresh] log reiniciado")
 
-    own_projects = set(args.project.split(",")) if args.project else None
-    pairs = workspace.ensure_workspace(PROJECTS_DIR, WORK_DIR, only=own_projects)
-    work_map = {name: path for name, path in pairs}
+    # Panel de progreso en una consola aparte (si SHOW_TERMINAL=1). Los workers de
+    # run_parallel se lanzan con --quiet, así que no abren su propio panel.
+    if not args.quiet:
+        progress_monitor.maybe_launch_terminal(DATA_DIR, LOG_PATH)
 
-    # Limpiar restos de ejecuciones interrumpidas; en paralelo solo los proyectos propios
-    for name, path in pairs:
-        if own_projects is not None and name not in own_projects:
-            continue
-        st = subprocess.run(["git", "-C", str(path), "status", "--porcelain"],
-                            capture_output=True, text=True).stdout.strip()
-        if st:
-            print(f"[limpieza] {name}: se restauran {len(st.splitlines())} archivos "
-                  f"modificados (ejecución anterior interrumpida)")
-            subprocess.run(["git", "-C", str(path), "restore", "."], check=True)
+    own_projects = set(args.project.split(",")) if args.project else None
+    work_map = _prepare_workspaces(own_projects)
 
     stats = {k: 0 for k in [
         "skipped_no_file", "skipped_no_technique", "skipped_not_found",
@@ -922,98 +1157,38 @@ def main():
         "batch_retries",
     ]}
 
-    csvs = sorted(DATA_DIR.glob("final_methods_dataset_*.csv"))
-    if args.project:
-        names = {f"final_methods_dataset_{p}.csv" for p in args.project.split(",")}
-        csvs = [c for c in csvs if c.name in names]
+    dataset = load_classified_dataset(args)
+    if dataset is None:
+        return
 
     done_keys = set() if args.fresh else load_done_keys(resume_path)
     if done_keys:
         print(f"[resume] {len(done_keys)} métodos ya procesados; se reanudará desde ahí")
 
-    total = sum(len(pd.read_csv(c)) for c in csvs)
-    labeled_total = sum(int((pd.read_csv(c)[TARGETS].sum(axis=1) > 0).sum()) for c in csvs)
+    total = len(dataset)
+    labeled_total = int((dataset[TARGETS].sum(axis=1) > 0).sum())
     progress = Progress(total, labeled_total, quiet=args.quiet)
 
     total_processed = 0
-    for csv_path in csvs:
-        project = csv_path.name.removeprefix("final_methods_dataset_").removesuffix(".csv")
+    for project, df in dataset.groupby("project", sort=True):
         if project not in work_map:
             continue
         work_path = work_map[project]
-
-        test_baseline = None
-        if RUN_TESTS in ("auto", "always") and not args.dry_run:
-            tool = detect_build_tool(work_path)
-            has_tests = (work_path / "src" / "test").exists() or (work_path / "test").exists()
-            if tool and (RUN_TESTS == "always" or has_tests):
-                print(f"[tests] baseline {project} ...")
-                test_baseline = run_tests_timed(work_path)
-
-        df = pd.read_csv(csv_path)
+        test_baseline = _maybe_baseline_tests(project, work_path, args.dry_run)
         print(f"\n=== {project} ({len(df)} métodos) ===")
-        pending = []
-        for _, row in df.iterrows():
-            if args.limit and total_processed >= args.limit:
-                break
-            key = (project, str(row["file"]), int(row["method_start_line"]))
-            if key in done_keys:
-                progress.update("reanudado", labeled=False, resumed=True)
-                total_processed += 1
-                continue
-            pending.append((key, row))
-            total_processed += 1
+
+        remaining = args.limit - total_processed if args.limit else None
+        pending, consumed = _pending_rows(project, df, done_keys, remaining, progress)
+        total_processed += consumed
 
         if REFACTOR_MODE == "batch":
-            entries = []
-            for key, row in pending:
-                ent, err = batch_entry(project, work_path, row)
-                if ent is None:
-                    status = err
-                    if err == "no_technique":
-                        stats["skipped_no_technique"] += 1
-                    elif err == "no_file":
-                        stats["skipped_no_file"] += 1
-                    else:
-                        stats["skipped_not_found"] += 1
-                    log_entry(project=project, file=str(row["file"]),
-                              start_line=int(row["method_start_line"]),
-                              reason="método no localizado en el proyecto original"
-                              if err == "not_found" else None,
-                              status=status, valid=err != "no_technique")
-                    done_keys.add(key)
-                    progress.update(status,
-                                    labeled=status not in ("no_file", "no_technique", "not_found"))
-                    continue
-                entries.append(ent)
-                # Trocear por presupuesto de tokens (dejamos siempre al menos 1)
-                if len(entries) > 1 and _batch_tokens(entries) > REFACTOR_BATCH_MAX_TOKENS * 0.8:
-                    chunk, entries = entries[:-1], [entries[-1]]
-                    for ent2, st in zip(chunk, process_batch(client, work_path, chunk,
-                                                             args.dry_run, stats)):
-                        key2 = (project, ent2["rel_file"], ent2["start_line"])
-                        done_keys.add(key2)
-                        progress.update(st, labeled=True)
-            if entries:
-                for ent2, st in zip(entries, process_batch(client, work_path, entries,
-                                                           args.dry_run, stats)):
-                    key2 = (project, ent2["rel_file"], ent2["start_line"])
-                    done_keys.add(key2)
-                    progress.update(st, labeled=True)
+            _process_pending_batch(project, work_path, pending, client, args.dry_run,
+                                   done_keys, stats, progress)
         else:
-            for key, row in pending:
-                status = process_method(project, work_path, row, client, args.dry_run, stats)
-                done_keys.add(key)  # checkpoint en memoria ante cortes
-                progress.update(status, labeled=status not in ("no_file", "no_technique", "not_found"))
+            _process_pending_stream(project, work_path, pending, client, args.dry_run,
+                                    done_keys, stats, progress)
 
-        if test_baseline is not None:
-            after = run_tests_timed(work_path)
-            log_entry(event="tests", project=project,
-                      baseline_seconds=test_baseline.get("wall_seconds"),
-                      baseline_success=test_baseline.get("success"),
-                      after_seconds=after.get("wall_seconds") if after else None,
-                      after_success=after.get("success") if after else None)
-            print(f"[tests] {project}: baseline={test_baseline} after={after}")
+        _run_after_tests(project, work_path, test_baseline)
 
         if args.limit and total_processed >= args.limit:
             break

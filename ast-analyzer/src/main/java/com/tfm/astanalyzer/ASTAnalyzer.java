@@ -5,6 +5,7 @@ import com.github.javaparser.ast.CompilationUnit;
 import com.github.javaparser.ast.Node;
 import com.github.javaparser.ast.body.CallableDeclaration;
 import com.github.javaparser.ast.body.ConstructorDeclaration;
+import com.github.javaparser.ast.body.EnumConstantDeclaration;
 import com.github.javaparser.ast.body.MethodDeclaration;
 import com.github.javaparser.ast.body.TypeDeclaration;
 import com.github.javaparser.ast.stmt.*;
@@ -12,6 +13,7 @@ import com.github.javaparser.ast.expr.BinaryExpr;
 import com.github.javaparser.ast.expr.ConditionalExpr;
 import com.github.javaparser.ast.expr.LambdaExpr;
 import com.github.javaparser.ast.expr.MethodCallExpr;
+import com.github.javaparser.ast.expr.ObjectCreationExpr;
 import com.github.javaparser.ast.stmt.ReturnStmt;
 import com.github.javaparser.ast.stmt.TryStmt;
 import com.github.javaparser.ast.stmt.SwitchStmt;
@@ -140,6 +142,7 @@ public class ASTAnalyzer {
             try (Stream<Path> paths = Files.walk(sourceRoot)) {
                 paths.filter(Files::isRegularFile)
                         .filter(p -> p.toString().endsWith(".java"))
+                        .filter(p -> !isTestSource(sourceRoot, p))
                         .forEach(files::add);
             } catch (IOException e) {
                 System.err.println("[WARN] Error al recorrer " + sourceRoot + ": " + e.getMessage());
@@ -208,11 +211,27 @@ public class ASTAnalyzer {
         }
     }
 
+    /**
+     * Excluye los tests en layouts Ant: cuando la raíz de fuentes es ".../src"
+     * (sin src/main/java), los tests cuelgan del primer nivel "test/". Solo se
+     * aplica a raíces llamadas "src" para no excluir paquetes Java llamados
+     * "test" dentro de src/main/java (layout Maven/Gradle).
+     */
+    private static boolean isTestSource(Path sourceRoot, Path file) {
+        if (!sourceRoot.getFileName().toString().equals("src")) {
+            return false;
+        }
+        Path rel = sourceRoot.relativize(file);
+        return rel.getNameCount() > 1 && rel.getName(0).toString().equals("test");
+    }
+
     private static void scanFile(Path root, Path file, int threshold, Gson gson, List<JsonObject> results) {
         try {
             CompilationUnit cu = StaticJavaParser.parse(file.toFile());
             for (CallableDeclaration<?> c : collectCallables(cu)) {
                 if (getBody(c).isEmpty()) continue;
+                if (isExcludedScope(c)) continue; // método de clase anónima/local (no lo reporta S3776)
+                if (isExcludedMethod(c)) continue; // equals/hashCode (S3776 también los ignora)
                 MethodMetrics m = analyzeMethod(c);
                 if (m.cognitive_complexity > threshold) {
                     JsonObject obj = new JsonObject();
@@ -261,6 +280,66 @@ public class ASTAnalyzer {
         all.addAll(cu.findAll(MethodDeclaration.class));
         all.addAll(cu.findAll(ConstructorDeclaration.class));
         return all;
+    }
+
+    /**
+     * Replica el criterio de SonarQube (java:S3776, shouldAnalyzeMethod): NO se
+     * reportan como issues los métodos declarados dentro de clases anónimas ni de
+     * clases locales (su complejidad se contabiliza dentro del método contenedor).
+     * Los métodos de clases miembro anidadas con nombre SÍ se analizan.
+     */
+    private static boolean isExcludedScope(CallableDeclaration<?> callable) {
+        Node parent = callable.getParentNode().orElse(null);
+        if (parent instanceof ObjectCreationExpr oce && oce.getAnonymousClassBody().isPresent()) {
+            return true; // método de clase anónima
+        }
+        if (parent instanceof EnumConstantDeclaration ecd && !ecd.getClassBody().isEmpty()) {
+            return true; // método del cuerpo de una constante de enum
+        }
+        // Subir hasta la declaración de tipo contenedora más próxima: si está
+        // dentro de un método (clase local) el método queda excluido.
+        Node n = parent;
+        while (n != null) {
+            if (n instanceof TypeDeclaration<?> td) {
+                return td.getParentNode().orElse(null) instanceof LocalClassDeclarationStmt;
+            }
+            if (n instanceof ObjectCreationExpr oce && oce.getAnonymousClassBody().isPresent()) {
+                return true;
+            }
+            n = n.getParentNode().orElse(null);
+        }
+        return false;
+    }
+
+    /**
+     * Replica la exclusión de SonarQube S3776 para métodos {@code equals} y
+     * {@code hashCode} (SONARJAVA-4335): públicos, no estáticos y con la firma
+     * canónica. Se basan en el nombre, el retorno primitivo y el tipo del
+     * parámetro, ya que el analizador no resuelve símbolos.
+     */
+    private static boolean isExcludedMethod(CallableDeclaration<?> callable) {
+        if (!(callable instanceof MethodDeclaration m)) return false;
+        return isEqualsMethod(m) || isHashCodeMethod(m);
+    }
+
+    private static boolean isEqualsMethod(MethodDeclaration m) {
+        if (!m.getNameAsString().equals("equals")) return false;
+        if (!m.isPublic() || m.isStatic()) return false;
+        if (m.getParameters().size() != 1) return false;
+        if (!isPrimitiveReturn(m, "boolean")) return false;
+        String type = m.getParameter(0).getType().asString().replaceAll("\\s+", "");
+        return type.equals("Object") || type.equals("java.lang.Object");
+    }
+
+    private static boolean isHashCodeMethod(MethodDeclaration m) {
+        if (!m.getNameAsString().equals("hashCode")) return false;
+        if (!m.isPublic() || m.isStatic()) return false;
+        if (!m.getParameters().isEmpty()) return false;
+        return isPrimitiveReturn(m, "int");
+    }
+
+    private static boolean isPrimitiveReturn(MethodDeclaration m, String primitive) {
+        return m.getType().isPrimitiveType() && m.getType().asString().equals(primitive);
     }
 
     /**
@@ -324,6 +403,16 @@ public class ASTAnalyzer {
             return Optional.of(matches.get(0));
         }
         if (matches.size() > 1) {
+            // Varios métodos comparten nombre y tipos de parámetros. Es el caso de
+            // métodos dentro de clases anónimas/locales, que comparten la ruta de
+            // clase contenedora. Se prefieren los métodos "reales" (no excluidos),
+            // que son los únicos que forman parte del dataset.
+            List<CallableDeclaration<?>> inScope = matches.stream()
+                    .filter(m -> !isExcludedScope(m))
+                    .toList();
+            if (inScope.size() == 1) {
+                return Optional.of(inScope.get(0));
+            }
             System.err.println("Ambiguo: la firma coincide con varios métodos:");
             for (CallableDeclaration<?> m : matches) {
                 int line = m.getRange().map(r -> r.begin.line).orElse(-1);
@@ -692,15 +781,18 @@ public class ASTAnalyzer {
     }
 
     private static boolean isForeachSimple(ForEachStmt loop) {
-        // El cuerpo no debe contener estructuras de control anidadas
+        // El cuerpo no debe contener estructuras de control anidadas. Se busca
+        // en el CUERPO del bucle, no en el bucle completo: findAll incluiría el
+        // propio foreach y lo marcaría siempre como no simple.
+        Statement body = loop.getBody();
         boolean hasNestedControl =
-                !loop.findAll(IfStmt.class).isEmpty()        ||
-                !loop.findAll(ForStmt.class).isEmpty()       ||
-                !loop.findAll(ForEachStmt.class).isEmpty()   ||
-                !loop.findAll(WhileStmt.class).isEmpty()     ||
-                !loop.findAll(DoStmt.class).isEmpty()        ||
-                !loop.findAll(TryStmt.class).isEmpty()       ||
-                !loop.findAll(SwitchStmt.class).isEmpty();
+                !body.findAll(IfStmt.class).isEmpty()        ||
+                !body.findAll(ForStmt.class).isEmpty()       ||
+                !body.findAll(ForEachStmt.class).isEmpty()   ||
+                !body.findAll(WhileStmt.class).isEmpty()     ||
+                !body.findAll(DoStmt.class).isEmpty()        ||
+                !body.findAll(TryStmt.class).isEmpty()       ||
+                !body.findAll(SwitchStmt.class).isEmpty();
 
         return !hasNestedControl;
     }

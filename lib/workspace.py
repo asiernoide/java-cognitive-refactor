@@ -82,9 +82,18 @@ def git_restore(work_dir: str | Path, relative_file: str) -> None:
 
 
 def git_commit(work_dir: str | Path, message: str) -> None:
-    """Commitea todos los cambios de la copia de trabajo (commit local)."""
+    """Commitea todos los cambios de la copia de trabajo (commit local).
+
+    La identidad se fija por comando (igual que en el commit inicial) para que
+    no dependa de la configuración git global de la máquina.
+    """
     subprocess.run(["git", "add", "-A"], cwd=str(work_dir), check=True)
-    subprocess.run(["git", "commit", "-m", message], cwd=str(work_dir), check=True)
+    subprocess.run(
+        ["git", "-c", "user.name=tfm-refactor", "-c", "user.email=tfm@local",
+         "commit", "-m", message],
+        cwd=str(work_dir),
+        check=True,
+    )
 
 
 if __name__ == "__main__":

@@ -77,12 +77,12 @@ Por ejemplo, un método con `nested_if_chains` y `map_candidate_loops` positivos
 
 | | Ruta |
 |---|---|
-| **Entrada** | `data/aggregated_method_data.csv` |
+| **Entrada** | `data/aggregated_method_data.csv` (incluye la columna `project`) |
 | **Salida** | `analysis/output/aggregated_method_data_metrics_labels.csv` |
 
-El CSV de salida contiene todas las columnas originales más 5 columnas nuevas con el sufijo `_metrics` (ej: `refactor_extract_method_metrics`), con valor `1` o `0`.
+El CSV de salida contiene todas las columnas originales más las 5 columnas `refactor_*` (p. ej. `refactor_extract_method`) con valor `1` o `0`. Es el **dataset clasificado que consume `refactor_loop.py`**.
 
-Además, si el CSV de entrada ya contiene columnas de refactorización (etiquetas de referencia), el script imprime una comparativa: porcentaje de acierto y recall por label.
+Además, si el CSV de entrada ya contiene columnas `refactor_*` (etiquetas de referencia), el script imprime una comparativa de acierto y recall por label antes de sobrescribirlas con sus predicciones.
 
 ## Uso
 

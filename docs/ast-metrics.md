@@ -4,6 +4,15 @@ Métricas estructurales calculadas por `ast-analyzer.jar` para cada método Java
 
 Además, calcula la `cognitive_complexity` replicando el algoritmo de Cognitive Complexity de SonarSource (ver [README — Complejidad cognitiva local](../README.md#complejidad-cognitiva-local)).
 
+## Alcance del escaneo (`scan`)
+
+Para replicar la regla `java:S3776` de SonarQube, el modo `scan` **no incluye**:
+
+- métodos declarados dentro de **clases anónimas o locales** (su complejidad sí se contabiliza dentro del método contenedor);
+- métodos `equals` y `hashCode` ([SONARJAVA-4335](https://github.com/SonarSource/sonar-java/commit/85a99860ef908cb028fbbce48b3c31fe6acd41db)).
+
+De este modo, el conjunto de métodos detectados coincide con el que SonarQube reportaría como issues.
+
 ---
 
 ## Identificación del método

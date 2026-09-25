@@ -5,12 +5,17 @@
 __pycache__/
 *.pyc
 /.venv
-/.env
+# Secretos: cualquier .env salvo la plantilla
+.env
+.env.*
+!.env.example
 /ast-analyzer/target/
 /ast-analyzer/ast-analyzer.jar
 /out/
+/out_old/
 /analysis/
 /notebooks/
 /data/*.csv
 /data/*.jsonl
+/data/old/
 /data/opencode_session.id

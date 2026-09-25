@@ -3,6 +3,7 @@
 Reparte los proyectos entre N workers (cada uno en su propio proceso y log) y
 fusiona los logs parciales en el principal. Cada proyecto lo procesa un solo
 worker (sin conflictos git) y cada worker usa un OPENCODE_SESSION_ID distinto.
+Con SHOW_TERMINAL=1 abre una consola aparte con el panel de progreso.
 
 Uso:
     python run_parallel.py -n 4 [--fresh] [--dry-run --limit N] [--resume F]
@@ -16,9 +17,24 @@ import sys
 import uuid
 from pathlib import Path
 
+from dotenv import load_dotenv
+
 ROOT = Path(__file__).resolve().parent
-DATA = ROOT / "data"
-PROJECTS = ROOT / "projects"
+sys.path.insert(0, str(ROOT))
+from lib import progress_monitor  # noqa: E402
+
+load_dotenv()
+
+
+def resolve_dir(env_name: str, default: str) -> Path:
+    """Directorio de configuración (DATA_DIR/PROJECTS_DIR), relativo al repo si
+    no es absoluto; así el reparto de workers respeta el .env igual que el bucle."""
+    path = Path(os.getenv(env_name, default))
+    return path if path.is_absolute() else ROOT / path
+
+
+DATA = resolve_dir("DATA_DIR", "data")
+PROJECTS = resolve_dir("PROJECTS_DIR", "projects")
 MAIN_LOG = DATA / "refactor_log.jsonl"
 WORKER_LOG_PATTERN = "refactor_log_w*.jsonl"
 
@@ -89,6 +105,9 @@ def main():
     print(f"{len(groups)} workers:")
     for i, g in enumerate(groups):
         print(f"  worker {i}: {', '.join(g)}")
+
+    # Panel de progreso en una consola aparte (si SHOW_TERMINAL=1)
+    progress_monitor.maybe_launch_terminal(DATA, MAIN_LOG)
 
     procs = []
     for idx, group in enumerate(groups):

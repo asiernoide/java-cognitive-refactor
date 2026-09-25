@@ -122,11 +122,17 @@ class LLMClient:
         return extract_json_object(content), usage
 
     def _post(self, url, headers, payload, timeout=None, stream=False):
+        total_timeout = timeout or self.timeout
+        # En streaming, el timeout del socket es (conexión, espera entre datos):
+        # un stream que deja de enviar datos falla rápido, mientras que el deadline
+        # TOTAL (que sí permite generaciones muy largas) lo vigila _consume_sse.
+        stall_timeout = int(os.getenv("LLM_STALL_TIMEOUT", "120"))
+        req_timeout = (15, stall_timeout) if stream else total_timeout
         last_err = None
         for attempt in range(MAX_RETRIES + 1):
             try:
                 resp = requests.post(url, headers=headers, json=payload,
-                                     timeout=timeout or self.timeout)
+                                     timeout=req_timeout)
             except requests.RequestException as e:
                 last_err = LLMError(f"Error de conexión: {e}")
                 time.sleep(2 ** attempt)
@@ -134,10 +140,8 @@ class LLMClient:
 
             if resp.status_code == 200:
                 if stream:
-                    return self._consume_sse(resp, timeout or self.timeout)
-                data = resp.json()
-                content = data["choices"][0]["message"]["content"]
-                return content, data.get("usage")
+                    return self._consume_sse(resp, total_timeout)
+                return self._parse_response(resp)
 
             body = resp.text[:400]
             if resp.status_code in _RETRY_STATUS:
@@ -148,6 +152,21 @@ class LLMClient:
             raise LLMError(f"HTTP {resp.status_code}: {body}")
 
         raise last_err if last_err else LLMError("Error desconocido al llamar al LLM")
+
+    @staticmethod
+    def _parse_response(resp):
+        """Extrae (contenido, usage) de una respuesta 200 no-streaming.
+
+        Un 200 con cuerpo no-JSON o sin choices (p. ej. una página de error del
+        gateway) se convierte en LLMError para que los reintentos del llamador
+        lo traten como un fallo del LLM y no como un crash.
+        """
+        try:
+            data = resp.json()
+            content = data["choices"][0]["message"]["content"]
+        except (ValueError, KeyError, IndexError, TypeError, AttributeError):
+            raise LLMError(f"HTTP 200 con formato inesperado: {resp.text[:400]!r}") from None
+        return content, data.get("usage")
 
     @staticmethod
     def _consume_sse(resp, timeout):

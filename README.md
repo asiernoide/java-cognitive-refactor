@@ -13,6 +13,8 @@ La métrica `cognitive_complexity` se calcula **100 % local** (sin SonarQube), r
 
 - **Implementación:** `ast-analyzer/src/main/java/com/tfm/astanalyzer/CognitiveComplexityVisitor.java` (visitante del AST con entry point `computeComplexity`).
 - **Integración:** la usa `ASTAnalyzer.analyzeMethod`; aparece como campo `cognitive_complexity` en los modos por línea/signatura y en `scan`.
+- **Exclusiones:** para replicar la regla `java:S3776` no se reportan los métodos declarados en clases anónimas o locales (su complejidad se contabiliza dentro del método contenedor) ni los métodos `equals`/`hashCode` ([SONARJAVA-4335](https://github.com/SonarSource/sonar-java/commit/85a99860ef908cb028fbbce48b3c31fe6acd41db)).
+- **Validación:** la implementación se contrastó con los valores reales de SonarQube para `fastjson` y coincide al **100 %** sobre la misma revisión del código (las discrepancias iniciales provenían de mezclar revisiones distintas de ese proyecto, no del algoritmo).
 - **Uso del analizador:** lo invoca `lib/ast_analyzer.py` (`scan_project_complex_methods`) desde `main.py` y `refactor_loop.py`.
 
 ## Requisitos
@@ -43,8 +45,9 @@ Copia `.env.example` a `.env` y rellena, al menos, las variables `LLM_*`. Los pa
 | Grupo | Variables |
 |---|---|
 | Directorios y umbral | `PROJECTS_DIR` (proyectos a analizar), `DATA_DIR` (datasets y logs), `WORK_DIR` (copias de trabajo, por defecto `out/`), `CC_THRESHOLD` (15) |
-| Refactorización | `REFACTOR_MODE` (`stream`/`batch`), `REFACTOR_CYCLO_PENALTY` (λ), `REFACTOR_MAX_CYCLO_DELTA_PCT`, `REFACTOR_SEED`, `REFACTOR_MAX_TOKENS`, `REFACTOR_BATCH_MAX_TOKENS`, `REFACTOR_BATCH_TIMEOUT`, `REFACTOR_BATCH_RETRIES`, `REFACTOR_RUN_TESTS` |
-| LLM | `LLM_BASE_URL`, `LLM_API_KEY`, `LLM_MODEL`, `LLM_TEMPERATURE`, `LLM_MAX_TOKENS`, `LLM_TIMEOUT`, `LLM_REASONING_EFFORT` |
+| Refactorización | `REFACTOR_MODE` (`stream`/`batch`), `REFACTOR_CYCLO_PENALTY` (λ), `REFACTOR_MAX_CYCLO_DELTA_PCT`, `REFACTOR_SEED`, `REFACTOR_MAX_TOKENS`, `REFACTOR_STREAM_TIMEOUT` (deadline de una generación individual), `REFACTOR_BATCH_MAX_TOKENS`, `REFACTOR_BATCH_TIMEOUT`, `REFACTOR_BATCH_RETRIES`, `REFACTOR_STREAM_FALLBACK`, `REFACTOR_BATCH_MAX_METHODS`, `REFACTOR_BATCH_OUTPUT_BUDGET`, `REFACTOR_RUN_TESTS` |
+| LLM | `LLM_BASE_URL`, `LLM_API_KEY`, `LLM_MODEL`, `LLM_TEMPERATURE`, `LLM_MAX_TOKENS`, `LLM_TIMEOUT`, `LLM_STALL_TIMEOUT` (silencio máximo del stream), `LLM_REASONING_EFFORT` |
+| Interfaz | `SHOW_TERMINAL` (con `1`, abre una consola aparte con el panel de progreso del bucle) |
 
 ### Criterio de aceptación de candidatos
 
@@ -76,7 +79,7 @@ Escanea cada proyecto de `projects/` (una subcarpeta por proyecto) y genera `dat
 python data/aggregate_method_data.py
 ```
 
-Genera `data/aggregated_method_data.csv` a partir de todos los `final_methods_dataset_*.csv`.
+Genera `data/aggregated_method_data.csv` a partir de todos los `final_methods_dataset_*.csv`, añadiendo una columna `project` con el origen de cada método.
 
 ### 3. Clasificador determinista (técnicas candidatas)
 
@@ -84,7 +87,7 @@ Genera `data/aggregated_method_data.csv` a partir de todos los `final_methods_da
 python metrics_classifier.py
 ```
 
-Aplica las reglas sobre las métricas del CSV agregado y guarda el resultado (columnas `*_metrics`, valor `1`/`0`) en `analysis/output/aggregated_method_data_metrics_labels.csv`. Si el CSV de entrada ya trae etiquetas de referencia, imprime además una comparativa de acierto/recall.
+Aplica las reglas sobre las métricas del agregado y guarda `analysis/output/aggregated_method_data_metrics_labels.csv` con las recomendaciones en las 5 columnas `refactor_*` (valor `1`/`0`), que es la **única fuente que consume el bucle**. Si el CSV de entrada ya trae etiquetas de referencia, imprime además una comparativa de acierto/recall.
 
 ### 4. Bucle de refactorización con LLM
 
@@ -92,14 +95,16 @@ Aplica las reglas sobre las métricas del CSV agregado y guarda el resultado (co
 python refactor_loop.py [--project <proyecto>] [--limit N] [--dry-run]
 ```
 
-Crea (o reutiliza) las copias de trabajo en `WORK_DIR` y procesa cada método de los CSV por proyecto con técnicas marcadas (`refactor_*` = 1). Los métodos se localizan por **signatura** (`nombre + tipos de parámetros`, única dentro de una clase) porque tras editar un archivo las líneas cambian. Cada intento (válido o no) se registra en `data/refactor_log.jsonl`. `--dry-run` no deja cambios ni commits.
+Lee el dataset clasificado (`analysis/output/aggregated_method_data_metrics_labels.csv`), crea (o reutiliza) las copias de trabajo en `WORK_DIR` y procesa cada método con `refactor_*` = 1. Los métodos se localizan por **signatura** (`nombre + tipos de parámetros`, única dentro de una clase) porque tras editar un archivo las líneas cambian. Cada intento (válido o no) se registra en `data/refactor_log.jsonl`. `--dry-run` no deja cambios ni commits.
 
-- **Modo batch:** `REFACTOR_MODE=batch` agrupa varios métodos en una sola llamada LLM (JSON); los que fallan (no parsean, JSON inválido, ausentes) se reintentan en rondas dirigidas (`REFACTOR_BATCH_RETRIES`) reenviando el error exacto al modelo.
+- **Modo batch:** `REFACTOR_MODE=batch` agrupa varios métodos en una sola llamada LLM (JSON); el lote se trocea por `REFACTOR_BATCH_MAX_METHODS` y `REFACTOR_BATCH_OUTPUT_BUDGET` para no truncar la respuesta. Los que fallan (no parsean, JSON inválido, ausentes) se reintentan en rondas dirigidas (`REFACTOR_BATCH_RETRIES`) reenviando el error exacto al modelo. Si aun así fallan, se reintentan individualmente en modo stream (`REFACTOR_STREAM_FALLBACK`); los que sigan fallando se registran como `llm_error` y **se reintentan al reanudar** (junto con `not_found`, `no_valid_candidate` y `apply_failed`).
 - **Ejecución paralela:** `run_parallel.py` reparte los proyectos entre N workers (un proyecto lo procesa un solo worker, cada uno con su workspace y su log) y fusiona después los logs parciales:
 
 ```bash
 python run_parallel.py -n 4 [--fresh] [--dry-run --limit N] [--resume F]
 ```
+
+- **Panel de progreso:** con `SHOW_TERMINAL=1` (tanto en `refactor_loop.py` como en `run_parallel.py`) se abre una consola aparte con el progreso en vivo —líneas de log, refactors conservados por worker y últimas líneas—; se cierra sola al terminar el proceso.
 
 ### 5. Dataset de entrenamiento desde el log
 
@@ -116,7 +121,7 @@ Combina el dataset original de métodos (con sus métricas) y el log del bucle: 
 # Escaneo de un proyecto: métodos con cognitive_complexity > umbral (15 por defecto)
 java -jar ast-analyzer/ast-analyzer.jar scan <raiz_proyecto> [umbral]
 
-# Por línea (legado)
+# Por línea (usado para localizar el método original del dataset)
 java -jar ast-analyzer/ast-analyzer.jar <archivo.java> <linea>
 
 # Por signatura: nombre + tipos de parámetros
@@ -128,9 +133,19 @@ java -jar ast-analyzer/ast-analyzer.jar <archivo.java> "MiClase.nombreMetodo(int
 
 Las raíces de fuentes se autodetectan por módulo: cada directorio con `pom.xml`, `build.gradle` o `build.xml` aporta su `src/main/java` (o `src` en layouts Ant); se excluyen tests y directorios de build.
 
+## Tests
+
+Suite de regresión con `unittest` (sin dependencias extra), ejecutable desde la raíz del repositorio:
+
+```bash
+python -m unittest discover -s tests -v
+```
+
+Cubre las utilidades del bucle (parseo/indentación del código del LLM, score y desempates, reanudación), las decisiones (selección, cap de ciclomática, lotes y reintentos), el analizador AST (contrato CLI y métricas sobre fixtures Java), el cliente LLM (sin red), el workspace git y los scripts de datos. Los tests que necesitan `java` y `ast-analyzer.jar` se omiten automáticamente si no están disponibles.
+
 ## Técnicas de refactorización
 
-Cada método se etiqueta con hasta 2 de las 5 técnicas siguientes (columnas `refactor_*` en los CSV):
+Cada método se etiqueta con hasta 2 de las 5 técnicas siguientes (columnas `refactor_*` del dataset clasificado):
 
 | Técnica | Columna en el CSV |
 |---|---|
@@ -150,9 +165,11 @@ java-cognitive-refactor/
 ├── metrics_classifier.py    # Clasificador determinista (reglas sobre métricas)
 ├── refactor_loop.py         # Bucle de refactorización con LLM
 ├── run_parallel.py          # Lanzador paralelo del bucle (N workers)
-├── lib/                     # ast_analyzer.py · llm_client.py · workspace.py
+├── lib/                     # ast_analyzer.py · llm_client.py · workspace.py · progress_monitor.py
 ├── ast-analyzer/            # Analizador Java (Maven + JavaParser) → .jar
 ├── data/                    # Scripts de agregación/dataset y salidas (CSV, logs)
+├── analysis/                # Comparativa ML y gráficas de resultados
+├── tests/                   # Suite de regresión (unittest) + fixtures Java
 ├── docs/                    # ast-metrics.md · labeler-script.md · images/
 ├── projects/                # (no versionado) proyectos Java a analizar
 ├── out/                     # (no versionado) copias de trabajo del refactor

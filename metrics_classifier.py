@@ -5,9 +5,10 @@ metricas estructurales del CSV (sin leer codigo fuente).
 Uso:
     python metrics_classifier.py
 
-Entrada:  aggregated_method_data.csv
-Salida:   aggregated_method_data_metrics_labels.csv (con 5 columnas nuevas *_metrics)
-          metrics_vs_script_comparison.png
+Entrada:  data/aggregated_method_data.csv (con columna `project`)
+Salida:   analysis/output/aggregated_method_data_metrics_labels.csv, con las
+          recomendaciones en las 5 columnas refactor_* (1/0), que es lo que
+          consume refactor_loop.py
 """
 
 import pandas as pd
@@ -23,7 +24,20 @@ TARGETS = [
     "refactor_lambda_filter_map",
     "refactor_lambda_reduce",
 ]
-OUTPUT_COLS = [f"{t}_metrics" for t in TARGETS]
+
+
+def extract_method_score(row: pd.Series) -> int:
+    """Heuristica compuesta de Extract Method: nº de condiciones cumplidas (0-4)."""
+    score = 0
+    if row["loc"] >= 80 and row["statement_count"] >= 40:
+        score += 1
+    if row["branch_count"] >= 8:
+        score += 1
+    if row["nested_if_chains_with_else"] >= 2 or row["max_if_nesting"] >= 3:
+        score += 1
+    if row["foreach_count"] >= 2 and row["statement_count"] >= 20:
+        score += 1
+    return score
 
 
 def classify_from_metrics(row: pd.Series) -> dict[str, int]:
@@ -64,27 +78,10 @@ def classify_from_metrics(row: pd.Series) -> dict[str, int]:
         track["refactor_lambda_reduce"] = int(row["reduce_candidate_loops"])
 
     # ── Extract Method ──
-    # Heuristica compuesta: metodo grande + mucha estructura interna
-    loc = row["loc"]
-    stmt = row["statement_count"]
-    branches = row["branch_count"]
-    nesting = row["max_if_nesting"]
-    chains_with_else = row["nested_if_chains_with_else"]
-    foreach = row["foreach_count"]
-
-    extract_score = 0
-    if loc >= 80 and stmt >= 40:
-        extract_score += 1
-    if branches >= 8:
-        extract_score += 1
-    if chains_with_else >= 2 or nesting >= 3:
-        extract_score += 1
-    if foreach >= 2 and stmt >= 20:
-        extract_score += 1
-
-    if extract_score >= 2:
+    score = extract_method_score(row)
+    if score >= 2:
         scores["refactor_extract_method"] = 2
-        track["refactor_extract_method"] = extract_score
+        track["refactor_extract_method"] = score
 
     # ── Seleccionar top 2: puntuacion desc; empate -> mayor metrica de activacion ──
     ordered = sorted(scores.items(), key=lambda kv: (-kv[1], -track[kv[0]]))
@@ -96,18 +93,21 @@ def classify_from_metrics(row: pd.Series) -> dict[str, int]:
 def main() -> None:
     df = pd.read_csv(DATA_DIR / "aggregated_method_data.csv")
 
-    # Aplicar clasificador a cada fila
+    # Etiquetas de referencia (si el agregado ya las trae) para la comparativa.
+    reference = df[TARGETS].copy() if all(t in df.columns for t in TARGETS) else None
+
+    # Aplicar el clasificador a cada fila y escribir las recomendaciones como refactor_*
     preds = df.apply(classify_from_metrics, axis=1, result_type="expand")
-    for src, dst in zip(TARGETS, OUTPUT_COLS):
-        df[dst] = preds[src]
+    for t in TARGETS:
+        df[t] = preds[t]
 
-    # Guardar CSV con etiquetas
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     df.to_csv(OUTPUT_DIR / "aggregated_method_data_metrics_labels.csv", index=False)
-    print(f"CSV guardado: analysis/output/aggregated_method_data_metrics_labels.csv")
+    print("CSV guardado: analysis/output/aggregated_method_data_metrics_labels.csv")
 
-    # ── Comparar con etiquetas del script original ──
-    if all(t in df.columns for t in TARGETS):
-        gt = df[TARGETS].fillna(0).astype(int)
+    # ── Comparar con etiquetas de referencia, si el CSV de entrada las traía ──
+    if reference is not None:
+        gt = reference.fillna(0).astype(int)
         print(f"\n{'Label':<36} {'% acierto':>9} {'Script=1':>9} {'Metricas=1':>10} {'Recall':>7}")
         print("-" * 75)
         for t in TARGETS:
